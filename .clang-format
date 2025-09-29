@@ -1,0 +1,29 @@
+# Based on LLVM style with modifications for Linux kernel style
+Language: Cpp
+BasedOnStyle: LLVM
+
+# Indentation
+IndentWidth: 8
+TabWidth: 8
+UseTab: ForIndentation
+
+# Braces
+BreakBeforeBraces: Linux
+AllowShortBlocksOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Spacing
+SpaceAfterCStyleCast: false
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeParens: ControlStatements
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+# Wrapping
+ColumnLimit: 80
+
+# Other
+IndentCaseLabels: false
+PointerAlignment: Right
