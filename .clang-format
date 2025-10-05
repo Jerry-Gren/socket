@@ -22,7 +22,7 @@ SpacesInParentheses: false
 SpacesInSquareBrackets: false
 
 # Wrapping
-ColumnLimit: 80
+ColumnLimit: 90
 
 # Other
 IndentCaseLabels: false
