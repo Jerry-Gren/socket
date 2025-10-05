@@ -1,3 +1,6 @@
+#ifndef GLOG_WRAPPER_H_
+#define GLOG_WRAPPER_H_
+
 #include <iostream>
 #include <string>
 #include <filesystem>
@@ -30,3 +33,5 @@ public:
 		google::ShutdownGoogleLogging();
 	}
 };
+
+#endif // GLOG_WRAPPER_H_

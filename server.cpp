@@ -33,13 +33,36 @@ void signal_handler(int signum)
 void handle_client(int client_socket)
 {
 	LOG(INFO) << "[Info] Handling client on socket " << client_socket;
-	// Send greeting message to client and close connection
-	const char *greeting_message = "Hello from server!";
+	char buffer[1024];
+
+	// Send an initial greeting message
+	const char *greeting_message = "Hello from server! This is an echo server.\n";
 	send(client_socket, greeting_message, strlen(greeting_message), 0);
-	// std::this_thread::sleep_for(std::chrono::seconds(30));
+
+	// Loop to receive and echo messages
+	ssize_t bytes_received;
+	while ((bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0)) >
+	       0) {
+		buffer[bytes_received] = '\0';
+		LOG(INFO) << "[Info] Received from client " << client_socket << ": "
+		          << buffer;
+
+		// Echo the message back to the client.
+		send(client_socket, buffer, bytes_received, 0);
+	}
+
+	// If recv returns 0 or -1, the loop breaks, meaning the client has
+	// disconnected
+	if (bytes_received == 0) {
+		LOG(INFO) << "[Info] Client " << client_socket
+		          << " disconnected gracefully.";
+	} else {
+		LOG(ERROR) << "[Error] recv failed for client " << client_socket << ": "
+		           << strerror(errno);
+	}
+
 	close(client_socket);
-	LOG(INFO) << "[Info] Finished handling client on socket "
-	          << client_socket;
+	LOG(INFO) << "[Info] Finished handling client on socket " << client_socket;
 }
 
 int main(int argc, char *argv[])
@@ -84,8 +107,7 @@ int main(int argc, char *argv[])
 		LOG(ERROR) << "[Error] Listening failed";
 		return -1;
 	}
-	LOG(INFO) << "[Info] Server is listening on port " << SERVER_PORT
-	          << "...";
+	LOG(INFO) << "[Info] Server is listening on port " << SERVER_PORT << "...";
 
 	// Server main loop
 	while (g_server_running) {
@@ -99,13 +121,12 @@ int main(int argc, char *argv[])
 		tv.tv_usec = 0;
 
 		// 5. Use select() for I/O multiplexing to wait for events
-		// without blocking.
-		int activity =
-		    select(server_socket + 1, &read_fds, NULL, NULL, &tv);
+		// without blocking
+		int activity = select(server_socket + 1, &read_fds, NULL, NULL, &tv);
 
 		// If select() returns an error, but it's not an interrupt from
 		// a signal (EINTR), then exit
-		if ((activity < 0) && (errno != EINTR)) {
+		if (activity < 0 && errno != EINTR) {
 			LOG(ERROR) << "[Error] select() error";
 			break;
 		}
@@ -113,29 +134,28 @@ int main(int argc, char *argv[])
 		// A new connection is pending
 		if (activity > 0 && FD_ISSET(server_socket, &read_fds)) {
 			// 6. Accept the new connection
-			client_socket = accept(
-			    server_socket, (struct sockaddr *)&client_address,
-			    &client_address_length);
+			client_socket =
+			    accept(server_socket, (struct sockaddr *)&client_address,
+			           &client_address_length);
 
 			if (client_socket < 0) {
-				LOG(ERROR) << "[Error] accept() failed: "
-				           << strerror(errno);
+				LOG(ERROR)
+				    << "[Error] accept() failed: " << strerror(errno);
 			} else {
 				LOG(INFO) << "[Info] A client has connected";
 				// 7. Create and detach a new thread to handle
 				// the client request.
 				//    OS will manage the detached thread's
 				//    resources
-				std::thread(handle_client, client_socket)
-				    .detach();
+				std::thread(handle_client, client_socket).detach();
 			}
 		}
 	}
 
 	// Close socket
-	LOG(INFO) << "[Info] Server is shutting down. Closing server socket.";
+	LOG(INFO) << "[Info] Server is shutting down. Closing server socket";
 	close(server_socket);
-	LOG(INFO) << "[Info] Server has shut down.";
+	LOG(INFO) << "[Info] Server has shut down";
 
 	return 0;
 }
