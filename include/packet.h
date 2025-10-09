@@ -3,37 +3,48 @@
 
 #include <string>
 #include <cstdint> // For uint8_t and so on
+#include <vector>
 
 /**
  * @enum MessageType
- * @brief Defines the different types of packets that can be sent or received.
- *
- * Using 'enum class' provides type safety (e.g., you can't accidentally compare it to an int).
- * Specifying the underlying type as uint8_t controls its size, which is useful for serialization.
+ * @brief Defines all possible message types for our protocol.
  */
 enum class MessageType : uint8_t {
-	UNDEFINED,      // undefined or error
-	CHAT_TEXT,      // normal chat message from user
-	SYSTEM_NOTICE,  // system notice from server (e.g. "User A joined")
-	USER_LOGIN      // login request
-	// ... TODO: Add more MessageType in future
-    };
+	// General
+	UNDEFINED = 0,
+
+	// Client to Server Requests
+	GET_TIME_REQUEST = 10,
+	GET_NAME_REQUEST = 11,
+	GET_CLIENT_LIST_REQUEST = 12,
+	SEND_MESSAGE_REQUEST = 13,
+	DISCONNECT_REQUEST = 14,
+
+	// Server to Client Responses (synchronous reply to a request)
+	GET_TIME_RESPONSE = 20,
+	GET_NAME_RESPONSE = 21,
+	GET_CLIENT_LIST_RESPONSE = 22,
+	SEND_MESSAGE_RESPONSE = 23,
+
+	// Server to Client Indications (asynchronous message)
+	MESSAGE_INDICATION = 30, // A message from another client
+	SERVER_SHUTDOWN_INDICATION = 31, // Server is shutting down
+	SYSTEM_NOTICE_INDICATION = 32
+};
 
 /**
  * @struct Packet
- * @brief Represents a structured data packet for network communication.
- *
- * This struct organizes message data, separating metadata (like the type)
- * from the actual payload (the content).
+ * @brief In-memory representation of our application-level packet.
+ * This struct will be serialized into a JSON string to form the payload.
  */
 struct Packet {
 	MessageType type = MessageType::UNDEFINED; // Type of packet
-	std::string content;                      // Content of packet (payload)
 
-	// TODO: Add more Packet fields in future
-	// uint32_t sender_id;
-	// uint64_t timestamp;
-	// ...
+	// The content is a flexible string, which we will use to store JSON data.
+	// We can easily add different fields for different message types.
+	// e.g., for SEND_MESSAGE_REQUEST: content = R"({"target_id": 123, "message": "Hello"})"
+	// e.g., for GET_TIME_RESPONSE: content = R"({"time": "2025-10-06 15:30:00 JST"})"
+	std::string content; // Content of packet (payload)
 };
 
 #endif // PACKET_H_

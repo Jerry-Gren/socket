@@ -10,11 +10,15 @@
 #include <atomic>          // For std::atomic
 #include <sys/select.h>    // For select()
 #include <cerrno>          // For errno
+#include <nlohmann/json.hpp>
 
 #define SERVER_PORT 4468
 #define MAX_CLIENT_QUEUE 20
 
 #include "include/glog_wrapper.h"
+#include "include/protocol.h"
+
+using json = nlohmann::json;
 // clang-format on
 
 std::atomic<bool> g_server_running(true);
@@ -36,29 +40,63 @@ void handle_client(int client_socket)
 	char buffer[1024];
 
 	// Send an initial greeting message
-	const char *greeting_message = "Hello from server! This is an echo server.\n";
-	send(client_socket, greeting_message, strlen(greeting_message), 0);
+	// const char *greeting_message = "Hello from server! This is an echo server.\n";
+	// send(client_socket, greeting_message, strlen(greeting_message), 0);
+	Packet greeting_pkt;
+	greeting_pkt.type = MessageType::SYSTEM_NOTICE_INDICATION;
+	greeting_pkt.content = json{
+		{
+			"notice", "Hello from server!"
+		}
+	}.dump();
 
-	// Loop to receive and echo messages
-	ssize_t bytes_received;
-	while ((bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0)) >
-	       0) {
-		buffer[bytes_received] = '\0';
-		LOG(INFO) << "[Info] Received from client " << client_socket << ": "
-		          << buffer;
+	std::vector<char> greeting_stream = create_message_stream(greeting_pkt);
+	send(client_socket, greeting_stream.data(), greeting_stream.size(), 0);
 
-		// Echo the message back to the client.
-		send(client_socket, buffer, bytes_received, 0);
-	}
+	// Main loop to handle incoming packets
+	while (true) {
+		std::vector<char> length_buffer;
+		// 1. Read the 4-byte total length prefix
+		if (!read_n_bytes(client_socket, 4, length_buffer)) {
+			LOG(INFO) << "[Info] Client " << client_socket << " disconnected.";
+			break;
+		}
+		uint32_t total_len = ntohl(*reinterpret_cast<uint32_t*>(length_buffer.data()));
 
-	// If recv returns 0 or -1, the loop breaks, meaning the client has
-	// disconnected
-	if (bytes_received == 0) {
-		LOG(INFO) << "[Info] Client " << client_socket
-		          << " disconnected gracefully.";
-	} else {
-		LOG(ERROR) << "[Error] recv failed for client " << client_socket << ": "
-		           << strerror(errno);
+		// 2. Read the rest of the packet data (Header + data)
+		std::vector<char> packet_data_buffer;
+		if (!read_n_bytes(client_socket, total_len, packet_data_buffer)) {
+			LOG(ERROR) << "[Error] Failed to read packet data for client " << client_socket;
+			break;
+		}
+
+		// 3. Parse the header and deserialize the payload
+		if (packet_data_buffer.size() < HEADER_SIZE) {
+			LOG(ERROR) << "[Error] Packet too small for header.";
+			continue;
+		}
+
+		uint32_t magic = ntohl(*reinterpret_cast<uint32_t*>(packet_data_buffer.data()));
+		if (magic != MAGIC_NUMBER) {
+			LOG(INFO) << "[Error] Invalid magic number from client " << client_socket;
+			continue; // Or disconnect client
+		}
+
+		Packet received_pkt;
+		received_pkt.type = static_cast<MessageType>(packet_data_buffer[4]);
+
+		uint32_t payload_len = ntohl(*reinterpret_cast<uint32_t*>(packet_data_buffer.data() + 8));
+		if (payload_len > 0) {
+			received_pkt.content.assign(packet_data_buffer.data() + HEADER_SIZE, payload_len);
+		}
+
+		LOG(INFO) << "Received a packet of type " << static_cast<int>(received_pkt.type)
+		  << " with payload: " << received_pkt.content;
+
+		// TODO: Add a switch statement here to handle different packet types
+		// For now, we just echo it back.
+		std::vector<char> response_stream = create_message_stream(received_pkt);
+		send(client_socket, response_stream.data(), response_stream.size(), 0);
 	}
 
 	close(client_socket);
