@@ -43,4 +43,13 @@ bool read_n_bytes(int socket, size_t n, std::vector<char>& buffer);
  */
 const char* MessageTypeToString(MessageType type);
 
+/**
+ * @brief Reads and deserializes a complete packet from the socket.
+ * @param socket The socket file descriptor to read from.
+ * @param pkt A reference to a Packet object to be populated.
+ * @return True if a packet was successfully read and parsed, false on any
+ * failure (e.g., disconnect, bad magic number, incomplete packet).
+ */
+bool read_packet(int socket, Packet& pkt);
+
 #endif // PROTOCOL_H_

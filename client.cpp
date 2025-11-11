@@ -11,6 +11,9 @@
 #include <condition_variable> // For std::condition_variable
 #include <queue>           // For std::queue
 #include <nlohmann/json.hpp>
+#include <iomanip>
+#include <sstream>
+#include <csignal>
 
 #include "include/glog_wrapper.h"
 #include "include/packet.h"
@@ -27,42 +30,30 @@ std::condition_variable g_cv;
 std::queue<Packet> g_msg_queue;
 std::atomic<bool> g_client_running(true);
 
+const char *g_prompt = "$ ";
+
+void client_signal_handler(int signum)
+{
+	LOG(INFO) << "[Cmd] Interrupt signal (" << signum
+	          << ") received. Shutting down...";
+	g_client_running = false;
+	g_cv.notify_all();
+}
+
 // Producer thread function
 // Receives messages from the server and puts them into the shared queue
 void receive_messages(int client_socket)
 {
 	while (g_client_running) {
-		std::vector<char> length_buffer;
-		// 1. Read the 4-byte total length prefix
-		if (!read_n_bytes(client_socket, 4, length_buffer)) {
+		Packet received_pkt;
+		if (!read_packet(client_socket, received_pkt)) {
+			// read_packet returns false on disconnect or critical error
 			if (g_client_running) { // Avoid error message on clean shutdown
 				LOG(INFO) << "[Info] Server disconnected.";
 			}
-			g_client_running = false;
-			g_cv.notify_all();
+			g_client_running = false; // Signal other threads to stop
+			g_cv.notify_all();        // Wake up presenter thread to exit
 			break;
-		}
-		uint32_t total_len = ntohl(*reinterpret_cast<uint32_t*>(length_buffer.data()));
-
-		// 2. Read the rest of the packet data
-		std::vector<char> packet_data_buffer;
-		if (!read_n_bytes(client_socket, total_len, packet_data_buffer)) {
-			LOG(ERROR) << "[Error] Failed to read packet data from server.";
-			g_client_running = false;
-			g_cv.notify_all();
-			break;
-		}
-
-		// 3. Parse and push to queue
-		if (packet_data_buffer.size() < HEADER_SIZE) continue;
-		uint32_t magic = ntohl(*reinterpret_cast<uint32_t*>(packet_data_buffer.data()));
-		if (magic != MAGIC_NUMBER) continue;
-
-		Packet received_pkt;
-		received_pkt.type = static_cast<MessageType>(packet_data_buffer[4]);
-		uint32_t payload_len = ntohl(*reinterpret_cast<uint32_t*>(packet_data_buffer.data() + 8));
-		if (payload_len > 0) {
-			received_pkt.content.assign(packet_data_buffer.data() + HEADER_SIZE, payload_len);
 		}
 
 		{
@@ -101,47 +92,212 @@ void present_messages()
 		}
 
 		if (has_message) {
-			// TODO: 现在可以根据 packet 的类型来决定如何显示
 			std::string output;
 			std::string type_str = MessageTypeToString(packet_to_show.type);
 
 			// Format different types of messages
 			switch (packet_to_show.type) {
-				case MessageType::SYSTEM_NOTICE_INDICATION:
-				case MessageType::GET_TIME_RESPONSE:
-				case MessageType::GET_NAME_RESPONSE:
-				case MessageType::GET_CLIENT_LIST_RESPONSE:
-				case MessageType::SEND_MESSAGE_RESPONSE:
-				case MessageType::MESSAGE_INDICATION:
-					// Try to parse JSON for all types of messages
-					try {
-						json data = json::parse(packet_to_show.content);
-						// [Server | TYPE]: Pretty-printed JSON content
-						output = "[Server | " + type_str + "]:\n" + data.dump(4); // dump(4) for pretty printing with 4 spaces
-					} catch (const json::parse_error& e) {
-						// If JSON parse fails, print error and content
-						output = "[Server | " + type_str + " | JSON PARSE ERROR]: " + e.what() + "\nRaw content: " + packet_to_show.content;
+			case MessageType::SYSTEM_NOTICE_INDICATION:
+				try {
+					json data = json::parse(packet_to_show.content);
+					output =
+					    "[System]: " + data.value("notice", "...");
+				} catch (const json::parse_error &) {
+					output = "[System]: (Parse Error)";
+				}
+				break;
+			case MessageType::GET_TIME_RESPONSE:
+				try {
+					json data = json::parse(packet_to_show.content);
+					output =
+					    "[Server Time]: " + data.value("time", "...");
+				} catch (const json::parse_error &) {
+					output = "[Server Time]: (Parse Error)";
+				}
+				break;
+			case MessageType::GET_NAME_RESPONSE:
+				try {
+					json data = json::parse(packet_to_show.content);
+					output =
+					    "[Server Name]: " + data.value("name", "...");
+				} catch (const json::parse_error &) {
+					output = "[Server Name]: (Parse Error)";
+				}
+				break;
+			case MessageType::GET_CLIENT_LIST_RESPONSE:
+				try {
+					json data = json::parse(packet_to_show.content);
+					std::ostringstream oss;
+					oss << "[Client List]:\n"
+					    << "  ID  | IP Address      | Port\n"
+					    << "-----------------------------------";
+					for (const auto &client : data.at("clients")) {
+						oss << "\n  " << std::setw(3) << std::left
+						    << client.value("id", 0) << " | "
+						    << std::setw(15) << std::left
+						    << client.value("ip", "...") << " | "
+						    << client.value("port", 0);
 					}
-					break;
+					output = oss.str();
+				} catch (const json::parse_error &) {
+					output = "[Client List]: (Parse Error)";
+				}
+				break;
+			case MessageType::SEND_MESSAGE_RESPONSE:
+				try {
+					json data = json::parse(packet_to_show.content);
+					if (data.value("status", "") == "success") {
+						output = "[Info]: Message sent to ID " +
+						         std::to_string(
+						             data.value("target_id", 0)) +
+						         " successfully.";
+					} else {
+						output = "[Error]: Failed to send "
+						         "message. Reason: " +
+						         data.value("message",
+						                    "Unknown error");
+					}
+				} catch (const json::parse_error &) {
+					output = "[Info]: (Send Status Parse Error)";
+				}
+				break;
+			case MessageType::MESSAGE_INDICATION:
+				try {
+					json data = json::parse(packet_to_show.content);
+					std::string from =
+					    std::to_string(data.value("from_id", 0));
+					output = "[Message from " + from +
+					         "]: " + data.value("message", "...");
+				} catch (const json::parse_error &) {
+					output = "[Message]: (Parse Error)";
+				}
+				break;
 
-				default:
-					// For unknown or unhandled types, print type and content
-					output = "[Server | " + type_str + " | UNHANDLED]: " + packet_to_show.content;
-					break;
+			default:
+				// For unknown or unhandled types, print type and content
+				try {
+					json data = json::parse(packet_to_show.content);
+					output = "[Server | " + type_str +
+					         " | UNHANDLED]:\n" + data.dump(4);
+				} catch (const json::parse_error &) {
+					output =
+					    "[Server | " + type_str +
+					    " | UNHANDLED]: " + packet_to_show.content;
+				}
+				break;
 			}
 			// \x1b[2K : Erases the entire current line.
 			// \r      : Moves the cursor to the beginning of the
 			// line.
 			std::cout << "\r\x1b[2K" << output << std::endl;
-			std::cout << "Enter message ('exit' to quit): " << std::flush;
+			std::cout << g_prompt << std::flush;
 		}
 	}
 	LOG(INFO) << "[Info] Presenter thread finished";
 }
 
+void on_command_help()
+{
+	std::cout << "--- Client Help ---\n"
+	          << "  help       - Show this help message\n"
+	          << "  time       - Request server time\n"
+	          << "  name       - Request server name\n"
+	          << "  list       - Request client list\n"
+	          << "  send       - Send a message to a client\n"
+	          << "  disconnect - Disconnect from server and exit\n"
+	          << "---------------------\n";
+}
+
+bool send_packet(int socket, const Packet &pkt)
+{
+	std::vector<char> message_stream = create_message_stream(pkt);
+	if (send(socket, message_stream.data(), message_stream.size(), 0) < 0) {
+		LOG(ERROR) << "[Error] Failed to send packet: "
+		           << MessageTypeToString(pkt.type);
+		g_client_running = false;
+		g_cv.notify_all();
+		return false;
+	}
+	return true;
+}
+
+void on_command_get_time(int socket)
+{
+	LOG(INFO) << "[Cmd] Requesting server time...";
+	Packet pkt;
+	pkt.type = MessageType::GET_TIME_REQUEST;
+	send_packet(socket, pkt);
+}
+
+void on_command_get_name(int socket)
+{
+	LOG(INFO) << "[Cmd] Requesting server name...";
+	Packet pkt;
+	pkt.type = MessageType::GET_NAME_REQUEST;
+	send_packet(socket, pkt);
+}
+
+void on_command_get_list(int socket)
+{
+	LOG(INFO) << "[Cmd] Requesting client list...";
+	Packet pkt;
+	pkt.type = MessageType::GET_CLIENT_LIST_REQUEST;
+	send_packet(socket, pkt);
+}
+
+void on_command_send_message(int socket)
+{
+	int target_id;
+	std::string message;
+	std::string temp_id_input;
+
+	std::cout << "Enter target client ID: " << std::flush;
+	if (!std::getline(std::cin, temp_id_input)) {
+		return;
+	}
+	try {
+		target_id = std::stoi(temp_id_input);
+	} catch (const std::invalid_argument &e) {
+		std::cout << "[Error] Invalid ID. Must be a number." << std::endl;
+		return;
+	}
+
+	std::cout << "Enter message: " << std::flush;
+	if (!std::getline(std::cin, message) || message.empty()) {
+		std::cout << "[Info] Message canceled." << std::endl;
+		return;
+	}
+
+	LOG(INFO) << "[Cmd] Sending message to ID " << target_id;
+	Packet pkt;
+	pkt.type = MessageType::SEND_MESSAGE_REQUEST;
+	pkt.content = json{{"target_id", target_id}, {"message", message}}.dump();
+	send_packet(socket, pkt);
+}
+
+void on_command_disconnect(int socket)
+{
+	LOG(INFO) << "[Cmd] Sending disconnect request...";
+	Packet pkt;
+	pkt.type = MessageType::DISCONNECT_REQUEST;
+	send_packet(socket, pkt);
+
+	g_client_running = false;
+	g_cv.notify_all();
+}
+
+void on_force_exit()
+{
+	LOG(INFO) << "[Cmd] Received Ctrl+D, exiting client...";
+	g_client_running = false;
+	g_cv.notify_all();
+}
+
 int main(int argc, char *argv[])
 {
 	auto glog = GlogWrapper(argv[0]);
+
+	signal(SIGINT, client_signal_handler);
 
 	int client_socket;
 	struct sockaddr_in server_address;
@@ -175,19 +331,13 @@ int main(int argc, char *argv[])
 
 	// Main loop for handling user input
 	// Uses select() to avoid blocking on std::getline
-	std::string line;
-	std::cout << "Enter message ('exit' to quit): " << std::flush;
 	while (g_client_running) {
 		fd_set read_fds;
 		FD_ZERO(&read_fds);
 		FD_SET(STDIN_FILENO, &read_fds);
-
-		// Set a timeout for select()
 		struct timeval tv;
-		tv.tv_sec = 1; // 1 second timeout
+		tv.tv_sec = 1;
 		tv.tv_usec = 0;
-
-		// Use select to wait for keyboard input with a timeout.
 		int activity = select(STDIN_FILENO + 1, &read_fds, NULL, NULL, &tv);
 
 		if (activity < 0 && errno != EINTR) {
@@ -195,42 +345,41 @@ int main(int argc, char *argv[])
 			break;
 		}
 
-		// If there is keyboard input, read and send it.
 		if (activity > 0 && FD_ISSET(STDIN_FILENO, &read_fds)) {
-			std::string line;
-			if (std::getline(std::cin, line)) {
-				// user types "exit", shutdown
-				if (line == "exit") {
-					g_client_running = false;
-					g_cv.notify_all();
-					break;
+			std::string command;
+			if (std::getline(std::cin, command)) {
+
+				if (command == "help") {
+					on_command_help();
+				} else if (command == "time") {
+					on_command_get_time(client_socket);
+				} else if (command == "name") {
+					on_command_get_name(client_socket);
+				} else if (command == "list") {
+					on_command_get_list(client_socket);
+				} else if (command == "send") {
+					on_command_send_message(client_socket);
+				} else if (command == "disconnect") {
+					on_command_disconnect(client_socket);
+				} else if (command.empty()) {
+				} else {
+					std::cout << "[Error] Unknown command: '"
+					          << command << "'" << std::endl;
 				}
 
-				Packet pkt_to_send;
-				pkt_to_send.type = MessageType::SEND_MESSAGE_REQUEST;
-				pkt_to_send.content = json{{"message", line}}.dump();
-
-				std::vector<char> message_stream = create_message_stream(pkt_to_send);
-
-				if (send(client_socket, message_stream.data(), message_stream.size(), 0) <
-				    0) {
-					LOG(ERROR) << "[Error] Failed to send message";
-					g_client_running = false;
-					g_cv.notify_all();
-					break;
+				if (g_client_running) {
+					std::cout << g_prompt << std::flush;
 				}
-				std::cout << "Enter message ('exit' to quit): "
-				          << std::flush;
+
 			} else {
-				// If stdin is closed (e.g., Ctrl+D), shutdown
-				g_client_running = false;
-				g_cv.notify_all();
+				// Ctrl+D shutdown
+				on_force_exit();
 				break;
 			}
 		}
 	}
 
-	LOG(INFO) << "[Info] Shutting down...";
+	LOG(INFO) << "[Info] Client is shutting down. Closing client socket";
 	// Shut down the socket to unblock the receiver thread from select/recv
 	shutdown(client_socket, SHUT_RDWR);
 	close(client_socket);

@@ -3,6 +3,7 @@
 #include <arpa/inet.h>      // For htonl, ntohl
 #include <vector>
 #include <map>
+#include <glog/logging.h>
 
 using json = nlohmann::json;
 
@@ -49,6 +50,49 @@ bool read_n_bytes(int socket, size_t n, std::vector<char>& buffer)
 		}
 		bytes_read += result;
 	}
+	return true;
+}
+
+bool read_packet(int socket, Packet& pkt)
+{
+	std::vector<char> length_buffer;
+	// 1. Read the 4-byte total length prefix
+	if (!read_n_bytes(socket, 4, length_buffer)) {
+		// Failed to read, likely a disconnect
+		return false;
+	}
+	uint32_t total_len = ntohl(*reinterpret_cast<uint32_t*>(length_buffer.data()));
+
+	// 2. Read the rest of the packet data (Header + Payload)
+	std::vector<char> packet_data_buffer;
+	if (!read_n_bytes(socket, total_len, packet_data_buffer)) {
+		LOG(ERROR) << "[Error] Failed to read packet data.";
+		return false;
+	}
+
+	// 3. Parse the header and deserialize the payload
+	if (packet_data_buffer.size() < HEADER_SIZE) {
+		LOG(ERROR) << "[Error] Packet too small for header.";
+		return false;
+	}
+
+	uint32_t magic = ntohl(*reinterpret_cast<uint32_t*>(packet_data_buffer.data()));
+	if (magic != MAGIC_NUMBER) {
+		LOG(ERROR) << "[Error] Invalid magic number.";
+		return false;
+	}
+
+	// Populate the output packet
+	pkt.type = static_cast<MessageType>(packet_data_buffer[4]);
+
+	uint32_t payload_len = ntohl(*reinterpret_cast<uint32_t*>(packet_data_buffer.data() + 8));
+	if (payload_len > 0) {
+		pkt.content.assign(packet_data_buffer.data() + HEADER_SIZE, payload_len);
+	} else {
+		pkt.content.clear();
+	}
+
+	// Successfully parsed
 	return true;
 }
 
