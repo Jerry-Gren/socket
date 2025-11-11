@@ -97,15 +97,6 @@ void present_messages()
 
 			// Format different types of messages
 			switch (packet_to_show.type) {
-			case MessageType::SYSTEM_NOTICE_INDICATION:
-				try {
-					json data = json::parse(packet_to_show.content);
-					output =
-					    "[System]: " + data.value("notice", "...");
-				} catch (const json::parse_error &) {
-					output = "[System]: (Parse Error)";
-				}
-				break;
 			case MessageType::GET_TIME_RESPONSE:
 				try {
 					json data = json::parse(packet_to_show.content);
@@ -170,6 +161,26 @@ void present_messages()
 					         "]: " + data.value("message", "...");
 				} catch (const json::parse_error &) {
 					output = "[Message]: (Parse Error)";
+				}
+				break;
+			case MessageType::SERVER_SHUTDOWN_INDICATION:
+				try {
+					json data = json::parse(packet_to_show.content);
+					output =
+					    "[Server Shutdown]: " + data.value("notice", "Server is shutting down.");
+				} catch (const json::parse_error &) {
+					output = "[Server Shutdown]: (Parse Error)";
+				}
+				// No more to do
+				// receiver_thread will stop afterward
+				break;
+			case MessageType::SYSTEM_NOTICE_INDICATION:
+				try {
+					json data = json::parse(packet_to_show.content);
+					output =
+					    "[System]: " + data.value("notice", "...");
+				} catch (const json::parse_error &) {
+					output = "[System]: (Parse Error)";
 				}
 				break;
 
@@ -247,7 +258,7 @@ void on_command_get_list(int socket)
 
 void on_command_send_message(int socket)
 {
-	int target_id;
+	uint64_t target_id;
 	std::string message;
 	std::string temp_id_input;
 
@@ -255,12 +266,31 @@ void on_command_send_message(int socket)
 	if (!std::getline(std::cin, temp_id_input)) {
 		return;
 	}
+
+	long long signed_target_id;
+	size_t pos_after_parse;
+
 	try {
-		target_id = std::stoi(temp_id_input);
+		signed_target_id = std::stoll(temp_id_input, &pos_after_parse);
 	} catch (const std::invalid_argument &e) {
 		std::cout << "[Error] Invalid ID. Must be a number." << std::endl;
 		return;
+	} catch (const std::out_of_range &e) {
+		std::cout << "[Error] ID is too large." << std::endl;
+		return;
 	}
+
+	if (pos_after_parse != temp_id_input.length()) {
+		std::cout << "[Error] Invalid ID. Contains non-numeric characters." << std::endl;
+		return;
+	}
+
+	if (signed_target_id <= 0) {
+		std::cout << "[Error] Invalid ID. Client ID must be a positive number." << std::endl;
+		return;
+	}
+
+	target_id = static_cast<uint64_t>(signed_target_id);
 
 	std::cout << "Enter message: " << std::flush;
 	if (!std::getline(std::cin, message) || message.empty()) {

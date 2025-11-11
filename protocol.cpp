@@ -63,6 +63,18 @@ bool read_packet(int socket, Packet& pkt)
 	}
 	uint32_t total_len = ntohl(*reinterpret_cast<uint32_t*>(length_buffer.data()));
 
+	if (total_len > MAX_PACKET_SIZE) {
+		LOG(ERROR) << "[Error] Packet size " << total_len
+			   << " exceeds max limit of " << MAX_PACKET_SIZE
+			   << ". Kicking client.";
+		return false;
+	}
+	if (total_len < HEADER_SIZE) {
+		LOG(ERROR) << "[Error] Packet size " << total_len
+			   << " is smaller than header. Kicking client.";
+		return false;
+	}
+
 	// 2. Read the rest of the packet data (Header + Payload)
 	std::vector<char> packet_data_buffer;
 	if (!read_n_bytes(socket, total_len, packet_data_buffer)) {
@@ -71,11 +83,6 @@ bool read_packet(int socket, Packet& pkt)
 	}
 
 	// 3. Parse the header and deserialize the payload
-	if (packet_data_buffer.size() < HEADER_SIZE) {
-		LOG(ERROR) << "[Error] Packet too small for header.";
-		return false;
-	}
-
 	uint32_t magic = ntohl(*reinterpret_cast<uint32_t*>(packet_data_buffer.data()));
 	if (magic != MAGIC_NUMBER) {
 		LOG(ERROR) << "[Error] Invalid magic number.";

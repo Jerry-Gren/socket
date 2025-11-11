@@ -1,6 +1,8 @@
 #ifndef PROTOCOL_H_
 #define PROTOCOL_H_
 
+#define MAX_PACKET_SIZE 65536
+
 #include "packet.h"
 #include <vector>
 #include <string>
@@ -11,12 +13,12 @@
  * |    (4 bytes)     +-------------------------+-----------------------------------+
  * |                  |     Header (12 bytes)   |         Payload (M bytes)         |
  * +------------------+-------------------------+-----------------------------------+
- *                    | Magic | Type |Resv|P Len|                                   |
- *                    | (4B)  | (1B) |(3B)|(4B) |           (JSON String)           |
+ * |                  | Magic | Type |Resv|P Len|                                   |
+ * |                  | (4B)  | (1B) |(3B)|(4B) |           (JSON String)           |
  * +------------------+-------+------+----+-----+-----------------------------------+
  */
 
-const uint32_t MAGIC_NUMBER = 0xDEADBEEF;
+const uint32_t MAGIC_NUMBER = 0xDBEEAEDF;
 const size_t HEADER_SIZE = 12; // Magic(4) + Type(1) + Reserved(3) + PayloadLength(4)
 
 /**

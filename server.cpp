@@ -23,6 +23,7 @@
 #include "include/protocol.h"
 #include "include/client_info.h"
 #include "include/client_manager.h"
+#include "include/utility.h"
 
 using json = nlohmann::json;
 // clang-format on
@@ -99,14 +100,14 @@ void handle_get_client_list_request(int client_id)
 
 void handle_send_message_request(int client_id, const std::string &content)
 {
-    int target_id;
+    uint64_t target_id;
     std::string message;
     Packet response_pkt;
     response_pkt.type = MessageType::SEND_MESSAGE_RESPONSE;
 
     try {
         json data = json::parse(content);
-        target_id = data.at("target_id").get<int>();
+    	target_id = data.at("target_id").get<uint64_t>();
         message = data.at("message").get<std::string>();
     } catch (const json::exception& e) {
         LOG(ERROR) << "[Error] Failed to parse SEND_MESSAGE_REQUEST from client "
@@ -135,7 +136,7 @@ void handle_send_message_request(int client_id, const std::string &content)
     forward_pkt.type = MessageType::MESSAGE_INDICATION;
     forward_pkt.content = json{
         {"from_id", client_id},
-        {"message", message}
+        {"message", sanitize_for_terminal(message)}
     }.dump();
 
     if (g_client_manager.send_to_client(target_id, forward_pkt)) {
@@ -179,7 +180,7 @@ void handle_client(int client_id, int client_socket)
 	Packet greeting_pkt;
 	greeting_pkt.type = MessageType::SYSTEM_NOTICE_INDICATION;
 	greeting_pkt.content =
-	    json{{"notice", "Hello from server! Your ID is " + std::to_string(client_id)}}
+	    json{{"notice", "Hello! Your ID is " + std::to_string(client_id)}}
 	        .dump();
 
 	g_client_manager.send_to_client(client_id, greeting_pkt);
@@ -197,7 +198,7 @@ void handle_client(int client_id, int client_socket)
 		}
 		LOG(INFO) << "Received from ID " << client_id
 		          << ", Type: " << MessageTypeToString(received_pkt.type)
-		          << ", Payload: " << received_pkt.content;
+		          << ", Payload: " << sanitize_for_terminal(received_pkt.content);
 
 		switch (received_pkt.type) {
 		case MessageType::GET_TIME_REQUEST:
@@ -322,13 +323,26 @@ int main(int argc, char *argv[])
 	}
 
 	// Close socket
-	LOG(INFO) << "[Info] Server is shutting down. Closing server socket";
-	/* TODO:
-	 * Before closing server_socket, we might want to send a
-	 * SERVER_SHUTDOWN_INDICATION to all connected clients.
-	 */
+	LOG(INFO) << "[Info] Server is shutting down. Closing server socket to stop new connections.";
 	close(server_socket);
-	LOG(INFO) << "[Info] Server has shut down";
+
+	// Prepare shutdown indication packet
+	LOG(INFO) << "[Info] Notifying all connected clients of shutdown...";
+	Packet shutdown_pkt;
+	shutdown_pkt.type = MessageType::SERVER_SHUTDOWN_INDICATION;
+	shutdown_pkt.content = json{
+	        {"notice", "Server is shutting down for maintenance. Please reconnect later."}
+	}.dump();
+
+	// Notify all clients
+	std::vector<ClientInfo> all_clients = g_client_manager.get_all_clients();
+	for (const auto& client : all_clients) {
+		LOG(INFO) << "[Info] Sending shutdown notice to Client ID: " << client.client_id;
+		g_client_manager.send_to_client(client.client_id, shutdown_pkt);
+		g_client_manager.remove_client(client.client_id);
+	}
+
+	LOG(INFO) << "[Info] All clients notified. Server has shut down.";
 
 	return 0;
 }
