@@ -14,15 +14,19 @@
 #include <iomanip>
 #include <sstream>
 #include <csignal>
+#include <fstream>
+#include <filesystem>
 
 #include "include/glog_wrapper.h"
 #include "include/packet.h"
 #include "include/protocol.h"
+#include "include/utility.h"
 
 #define SERVER_ADDRESS "127.0.0.1"
 #define SERVER_PORT 4468
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 // clang-format on
 
 std::mutex g_msg_queue_mutex;
@@ -152,6 +156,36 @@ void present_messages()
 					output = "[Info]: (Send Status Parse Error)";
 				}
 				break;
+			case MessageType::FILE_INDICATION:
+				try {
+					json data = json::parse(packet_to_show.content);
+					std::string from_id = std::to_string(data.value("from_id", 0));
+					std::string filename = sanitize_for_terminal(data.value("filename", "unknown"));
+					std::string encoded_data = data.value("data", "");
+					bool is_eof = data.value("eof", false);
+
+					std::string save_dir = "downloads";
+					if (!fs::exists(save_dir)) fs::create_directory(save_dir);
+
+					std::string save_path = save_dir + "/" + from_id + "_" + filename;
+
+					if (is_eof) {
+						output = "[File]: Finished receiving file: " + save_path;
+					} else {
+						std::vector<char> binary_data = base64_decode(encoded_data);
+
+						std::ofstream outfile(save_path, std::ios::binary | std::ios::app);
+						outfile.write(binary_data.data(), binary_data.size());
+						outfile.close();
+
+						std::cout << "." << std::flush;
+						continue;
+					}
+
+				} catch (const std::exception &e) {
+					output = "[File Error]: " + std::string(e.what());
+				}
+				break;
 			case MessageType::MESSAGE_INDICATION:
 				try {
 					json data = json::parse(packet_to_show.content);
@@ -215,6 +249,7 @@ void on_command_help()
 	          << "  name       - Request server name\n"
 	          << "  list       - Request client list\n"
 	          << "  send       - Send a message to a client\n"
+		  << "  sendfile   - Send a file to a client\n"
 	          << "  disconnect - Disconnect from server and exit\n"
 	          << "---------------------\n";
 }
@@ -303,6 +338,68 @@ void on_command_send_message(int socket)
 	pkt.type = MessageType::SEND_MESSAGE_REQUEST;
 	pkt.content = json{{"target_id", target_id}, {"message", message}}.dump();
 	send_packet(socket, pkt);
+}
+
+void on_command_send_file(int socket)
+{
+    uint64_t target_id;
+    std::string filepath, temp_id_input;
+
+    std::cout << "Enter target client ID: " << std::flush;
+    if (!std::getline(std::cin, temp_id_input)) return;
+    try {
+        target_id = std::stoull(temp_id_input);
+    } catch (...) {
+        std::cout << "[Error] Invalid ID." << std::endl; return;
+    }
+
+    std::cout << "Enter file path to send: " << std::flush;
+    if (!std::getline(std::cin, filepath)) return;
+
+    if (!fs::exists(filepath)) {
+        std::cout << "[Error] File does not exist." << std::endl;
+        return;
+    }
+
+    std::string filename = fs::path(filepath).filename().string();
+    std::ifstream file(filepath, std::ios::binary);
+
+    const size_t CHUNK_SIZE = 32 * 1024;
+    std::vector<char> buffer(CHUNK_SIZE);
+
+    LOG(INFO) << "[Cmd] Starting file transfer: " << filename;
+
+    while (file.read(buffer.data(), CHUNK_SIZE) || file.gcount() > 0) {
+        size_t bytes_read = file.gcount();
+        std::vector<char> chunk_data(buffer.begin(), buffer.begin() + bytes_read);
+
+        std::string encoded_data = base64_encode(chunk_data);
+
+        Packet pkt;
+        pkt.type = MessageType::SEND_FILE_REQUEST;
+        pkt.content = json{
+            {"target_id", target_id},
+            {"filename", filename},
+            {"data", encoded_data},
+            {"eof", false}
+        }.dump();
+
+        if (!send_packet(socket, pkt)) return;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    Packet end_pkt;
+    end_pkt.type = MessageType::SEND_FILE_REQUEST;
+    end_pkt.content = json{
+        {"target_id", target_id},
+        {"filename", filename},
+        {"data", ""},
+        {"eof", true}
+    }.dump();
+    send_packet(socket, end_pkt);
+
+    LOG(INFO) << "[Cmd] File sent complete.";
 }
 
 void on_command_disconnect(int socket)
@@ -395,6 +492,8 @@ int main(int argc, char *argv[])
 					on_command_get_list(client_socket);
 				} else if (command == "send") {
 					on_command_send_message(client_socket);
+				} else if (command == "sendfile") {
+					on_command_send_file(client_socket);
 				} else if (command == "disconnect") {
 					on_command_disconnect(client_socket);
 				} else if (command.empty()) {

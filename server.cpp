@@ -155,6 +155,31 @@ void handle_send_message_request(int client_id, const std::string &content)
     }
 }
 
+void handle_send_file_request(int client_id, const std::string &content)
+{
+	try {
+		json data = json::parse(content);
+		uint64_t target_id = data.at("target_id").get<uint64_t>();
+
+		if (!g_client_manager.get_client(target_id).has_value()) {
+			return;
+		}
+
+		Packet forward_pkt;
+		forward_pkt.type = MessageType::FILE_INDICATION;
+
+		data["from_id"] = client_id;
+		data.erase("target_id");
+
+		forward_pkt.content = data.dump();
+
+		g_client_manager.send_to_client(target_id, forward_pkt);
+
+	} catch (...) {
+		LOG(ERROR) << "Failed to handle file request from " << client_id;
+	}
+}
+
 void handle_unhandled_request(int client_id, MessageType type, const std::string &content)
 {
 	LOG(WARNING) << "[Warning] Unhandled message type from client " << client_id
@@ -212,6 +237,9 @@ void handle_client(int client_id, int client_socket)
 			break;
 		case MessageType::SEND_MESSAGE_REQUEST:
 			handle_send_message_request(client_id, received_pkt.content);
+			break;
+		case MessageType::SEND_FILE_REQUEST:
+			handle_send_file_request(client_id, received_pkt.content);
 			break;
 		case MessageType::DISCONNECT_REQUEST:
 			LOG(INFO)

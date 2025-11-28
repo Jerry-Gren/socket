@@ -18,18 +18,21 @@ enum class MessageType : uint8_t {
 	GET_NAME_REQUEST = 11,
 	GET_CLIENT_LIST_REQUEST = 12,
 	SEND_MESSAGE_REQUEST = 13,
-	DISCONNECT_REQUEST = 14,
+	SEND_FILE_REQUEST = 14,
+	DISCONNECT_REQUEST = 15,
 
 	// Server to Client Responses (synchronous reply to a request)
 	GET_TIME_RESPONSE = 20,
 	GET_NAME_RESPONSE = 21,
 	GET_CLIENT_LIST_RESPONSE = 22,
 	SEND_MESSAGE_RESPONSE = 23,
+	SEND_FILE_RESPONSE = 24,
 
 	// Server to Client Indications (asynchronous message)
 	MESSAGE_INDICATION = 30, // A message from another client
 	SERVER_SHUTDOWN_INDICATION = 31, // Server is shutting down
-	SYSTEM_NOTICE_INDICATION = 32
+	SYSTEM_NOTICE_INDICATION = 32,
+	FILE_INDICATION = 33,
 };
 
 /**
