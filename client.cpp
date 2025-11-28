@@ -329,6 +329,11 @@ int main(int argc, char *argv[])
 
 	signal(SIGINT, client_signal_handler);
 
+	std::string target_ip = SERVER_ADDRESS; // Default is 127.0.0.1
+	if (argc > 1) {
+		target_ip = argv[1];
+	}
+
 	int client_socket;
 	struct sockaddr_in server_address;
 
@@ -342,7 +347,8 @@ int main(int argc, char *argv[])
 	// 2. Set server address
 	memset(&server_address, 0, sizeof(server_address));
 	server_address.sin_family = AF_INET;
-	server_address.sin_addr.s_addr = inet_addr(SERVER_ADDRESS);
+	// server_address.sin_addr.s_addr = inet_addr(SERVER_ADDRESS);
+	server_address.sin_addr.s_addr = inet_addr(target_ip.c_str());
 	server_address.sin_port = htons(SERVER_PORT);
 
 	// 3. Connect to server
