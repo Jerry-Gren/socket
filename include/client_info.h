@@ -8,7 +8,7 @@
  * @brief Holds all relevant information for a single connected client.
  */
 struct ClientInfo {
-	int client_id;
+	uint64_t client_id;
 	int socket_fd;
 	std::string ip_address;
 	int port;

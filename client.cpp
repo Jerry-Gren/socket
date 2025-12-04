@@ -200,7 +200,7 @@ void present_messages()
 			// \x1b[2K : Erases the entire current line.
 			// \r      : Moves the cursor to the beginning of the
 			// line.
-			std::cout << "\r\x1b[2K" << output << std::endl;
+			std::cout << "\r\x1b[2K" << output << "\n";
 			std::cout << g_prompt << std::flush;
 		}
 	}
@@ -267,34 +267,34 @@ void on_command_send_message(int socket)
 		return;
 	}
 
-	long long signed_target_id;
+	unsigned long long parsed_id;
 	size_t pos_after_parse;
 
 	try {
-		signed_target_id = std::stoll(temp_id_input, &pos_after_parse);
+		parsed_id = std::stoull(temp_id_input, &pos_after_parse);
 	} catch (const std::invalid_argument &e) {
-		std::cout << "[Error] Invalid ID. Must be a number." << std::endl;
+		std::cout << "[Error] Invalid ID. Must be a number.\n";
 		return;
 	} catch (const std::out_of_range &e) {
-		std::cout << "[Error] ID is too large." << std::endl;
+		std::cout << "[Error] ID is too large.\n";
 		return;
 	}
 
 	if (pos_after_parse != temp_id_input.length()) {
-		std::cout << "[Error] Invalid ID. Contains non-numeric characters." << std::endl;
+		std::cout << "[Error] Invalid ID. Contains non-numeric characters.\n";
 		return;
 	}
 
-	if (signed_target_id <= 0) {
-		std::cout << "[Error] Invalid ID. Client ID must be a positive number." << std::endl;
+	if (parsed_id <= 0) {
+		std::cout << "[Error] Invalid ID. Client ID must be a positive number.\n";
 		return;
 	}
 
-	target_id = static_cast<uint64_t>(signed_target_id);
+	target_id = static_cast<uint64_t>(parsed_id);
 
 	std::cout << "Enter message: " << std::flush;
 	if (!std::getline(std::cin, message) || message.empty()) {
-		std::cout << "[Info] Message canceled." << std::endl;
+		std::cout << "[Info] Message canceled.\n";
 		return;
 	}
 
@@ -374,7 +374,7 @@ int main(int argc, char *argv[])
 		struct timeval tv;
 		tv.tv_sec = 1;
 		tv.tv_usec = 0;
-		int activity = select(STDIN_FILENO + 1, &read_fds, NULL, NULL, &tv);
+		int activity = select(STDIN_FILENO + 1, &read_fds, nullptr, nullptr, &tv);
 
 		if (activity < 0 && errno != EINTR) {
 			LOG(ERROR) << "select() error on stdin";
@@ -400,7 +400,7 @@ int main(int argc, char *argv[])
 				} else if (command.empty()) {
 				} else {
 					std::cout << "[Error] Unknown command: '"
-					          << command << "'" << std::endl;
+					          << command << "'\n";
 				}
 
 				if (g_client_running) {

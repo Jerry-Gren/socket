@@ -14,7 +14,7 @@ public:
 		const std::string log_dir = "./logs";
 		if (!std::filesystem::exists(log_dir)) {
 			std::cerr << "Log directory '" << log_dir <<
-				"' not found. Creating it..." << std::endl;
+				"' not found. Creating it...\n";
 			std::filesystem::create_directory(log_dir);
 		}
 

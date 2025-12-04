@@ -286,7 +286,7 @@ int main(int argc, char *argv[])
 
 		// 5. Use select() for I/O multiplexing to wait for events
 		// without blocking
-		int activity = select(server_socket + 1, &read_fds, NULL, NULL, &tv);
+		int activity = select(server_socket + 1, &read_fds, nullptr, nullptr, &tv);
 
 		// If select() returns an error, but it's not an interrupt from
 		// a signal (EINTR), then exit
@@ -311,7 +311,7 @@ int main(int argc, char *argv[])
 				int port = ntohs(client_address.sin_port);
 
 				// 7. Add client to manager and get its ID
-				int client_id =
+				uint64_t client_id =
 				    g_client_manager.add_client(client_socket, ip, port);
 
 				// 8. Create and detach a new thread to handle the client
