@@ -25,10 +25,10 @@ Before building, ensure you have the following installed:
    $ cmake ..
    ```
 
-3. Build the project with all available CPU cores:
+3. Build the project:
 
    ```shell
-   $ make -j$(nproc)
+   $ cmake --build . -j
    ```
 
 4. Check if both `client` and `server` exist in this build folder.
