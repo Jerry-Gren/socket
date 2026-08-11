@@ -77,7 +77,19 @@ Download a remote file:
 ```
 
 `xcp` prints transfer progress and ETA to stderr.
-Relative download destinations are written under the executable directory.
+Paths follow scp-like file semantics:
+
+- `local -> user@host:path` uploads a local file.
+- `user@host:path -> local` downloads a remote file.
+- Remote absolute paths are used as-is.
+- Remote `~` and `~/...` expand on the host running `xshd`.
+- Remote relative paths are resolved by the `xshd` process.
+- Local paths are resolved by the local `xcp` process.
+- If the destination is an existing local directory, the remote file name is used.
+- If an upload destination ends with `/`, the local file name is used.
+
+Remote file access is limited by the OS permissions of the user that started
+`xshd`. Recursive directory copy is not implemented yet.
 
 ## Reference
 

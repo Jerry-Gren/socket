@@ -357,6 +357,12 @@ bool send_file_upload(int socket_fd, SecureSession &secure_session,
 
 	uint64_t request_id = 1;
 	uint64_t total_size = fs::file_size(source);
+	std::string destination_path = remote_path;
+	if (!destination_path.empty() &&
+	    (destination_path.back() == '/' || destination_path.back() == '\\')) {
+		destination_path += source.filename().string();
+	}
+
 	std::ifstream file(source, std::ios::binary);
 	if (!file.is_open()) {
 		std::cerr << "xcp: failed to open source file\n";
@@ -366,7 +372,7 @@ bool send_file_upload(int socket_fd, SecureSession &secure_session,
 	Packet request_pkt;
 	request_pkt.type = MessageType::FILE_PUT_REQUEST;
 	request_pkt.content = create_file_request_payload(
-	    request_id, total_size, remote_path);
+	    request_id, total_size, destination_path);
 	if (!send_secure_packet(socket_fd, secure_session, request_pkt)) {
 		return false;
 	}
@@ -436,12 +442,13 @@ bool receive_file_download(int socket_fd, SecureSession &secure_session,
 	}
 
 	fs::path output_path = destination;
-	if (output_path.is_relative()) {
-		output_path = fs::path(g_executable_dir) / output_path;
-	}
 	std::error_code ec;
-	if (output_path.has_parent_path()) {
-		fs::create_directories(output_path.parent_path(), ec);
+	if (fs::exists(output_path, ec) && fs::is_directory(output_path, ec)) {
+		output_path /= fs::path(remote_path).filename();
+	}
+	if (output_path.empty() || output_path.filename().empty()) {
+		std::cerr << "xcp: invalid destination file\n";
+		return false;
 	}
 	std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
 	if (!output.is_open()) {

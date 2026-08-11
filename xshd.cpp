@@ -5,6 +5,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -348,14 +349,20 @@ void handle_shell_stdin(uint64_t connection_id, const std::string &content)
 	push_shell_input(ShellInputKey{connection_id, input.request_id}, input);
 }
 
-bool is_safe_destination(const fs::path &path)
+fs::path expand_remote_path(const std::string &path)
 {
-	for (const auto &part : path) {
-		if (part == "..") {
-			return false;
+	if (path == "~" || path.rfind("~/", 0) == 0) {
+		if (const char *home = std::getenv("HOME")) {
+			if (*home != '\0') {
+				fs::path expanded(home);
+				if (path.size() > 2) {
+					expanded /= path.substr(2);
+				}
+				return expanded;
+			}
 		}
 	}
-	return true;
+	return fs::path(path);
 }
 
 void handle_file_put_request(std::map<uint64_t, std::ofstream> &uploads,
@@ -369,23 +376,14 @@ void handle_file_put_request(std::map<uint64_t, std::ofstream> &uploads,
 		return;
 	}
 
-	fs::path path = fs::path(request.path);
-	if (!is_safe_destination(path)) {
-		send_file_result(socket, secure_session, send_mutex,
-		                 request.request_id, false, 1,
-		                 "refusing path containing '..'");
-		return;
-	}
+	fs::path path = expand_remote_path(request.path);
 
 	std::error_code ec;
-	if (path.has_parent_path()) {
-		fs::create_directories(path.parent_path(), ec);
-		if (ec) {
-			send_file_result(socket, secure_session, send_mutex,
-			                 request.request_id, false, 1,
-			                 "failed to create destination directory");
-			return;
-		}
+	if (fs::exists(path, ec) && fs::is_directory(path, ec)) {
+		send_file_result(socket, secure_session, send_mutex,
+		                 request.request_id, false, 1,
+		                 "destination is a directory");
+		return;
 	}
 
 	auto &stream = uploads[request.request_id];
@@ -446,7 +444,7 @@ void handle_file_get_request(int socket, SecureSession &secure_session,
 		return;
 	}
 
-	fs::path path = fs::path(request.path);
+	fs::path path = expand_remote_path(request.path);
 	if (!fs::exists(path) || !fs::is_regular_file(path)) {
 		send_file_result(socket, secure_session, send_mutex,
 		                 request.request_id, false, 1,

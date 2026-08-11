@@ -383,7 +383,7 @@ bool verify_or_record_host_key(const std::string &known_hosts_path,
 	       << "\n";
 	output.close();
 	chmod(known_hosts_path.c_str(), S_IRUSR | S_IWUSR);
-	std::cerr << "xsh: recorded host key for " << pattern
+	std::cerr << "host-key: recorded " << pattern
 	          << " SHA256:" << fingerprint_sha256(host_public_key) << "\n";
 	return true;
 }
