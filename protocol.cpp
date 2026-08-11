@@ -142,6 +142,8 @@ const char* MessageTypeToString(MessageType type) {
 		{MessageType::UNDEFINED, "UNDEFINED"},
 		{MessageType::KEY_EXCHANGE, "KEY_EXCHANGE"},
 		{MessageType::ENCRYPTED_PACKET, "ENCRYPTED_PACKET"},
+		{MessageType::AUTH_REQUEST, "AUTH_REQUEST"},
+		{MessageType::AUTH_RESULT, "AUTH_RESULT"},
 		{MessageType::SHELL_EXEC_REQUEST, "SHELL_EXEC_REQUEST"},
 		{MessageType::SHELL_EXEC_STDIN, "SHELL_EXEC_STDIN"},
 		{MessageType::SHELL_EXEC_OUTPUT, "SHELL_EXEC_OUTPUT"},

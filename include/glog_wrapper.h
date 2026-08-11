@@ -5,13 +5,15 @@
 #include <string>
 #include <filesystem>
 #include <glog/logging.h> // For glog
+#include "utility.h"
 
 class GlogWrapper
 {
 public:
 	GlogWrapper(char *program, bool also_log_to_stderr = true)
 	{
-		const std::string log_dir = "./logs";
+		const std::string log_dir =
+		    path_under_executable_dir(program, "logs");
 		if (!std::filesystem::exists(log_dir)) {
 			if (also_log_to_stderr) {
 				std::cerr << "Log directory '" << log_dir

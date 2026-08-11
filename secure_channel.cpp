@@ -4,6 +4,7 @@
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/params.h>
+#include <openssl/sha.h>
 
 #include <cstring>
 #include <memory>
@@ -13,10 +14,12 @@
 namespace {
 
 constexpr size_t X25519_PUBLIC_KEY_SIZE = 32;
+constexpr size_t ED25519_PUBLIC_KEY_SIZE = 32;
 constexpr size_t AES_256_KEY_SIZE = 32;
 constexpr size_t AES_GCM_TAG_SIZE = 16;
 constexpr size_t AES_GCM_NONCE_SIZE = 12;
 constexpr unsigned char SECURE_PACKET_VERSION = 1;
+constexpr unsigned char HOST_AUTH_VERSION = 2;
 
 using EvpPkeyPtr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
 using EvpPkeyCtxPtr =
@@ -51,6 +54,45 @@ bool read_uint32(const std::string &input, size_t &offset, uint32_t &value)
 	}
 	offset += 4;
 	return true;
+}
+
+bool read_string(const std::string &input, size_t &offset, std::string &value)
+{
+	uint32_t size = 0;
+	if (!read_uint32(input, offset, size) ||
+	    offset + size > input.size()) {
+		return false;
+	}
+	value.assign(input.data() + offset, size);
+	offset += size;
+	return true;
+}
+
+void append_string(std::string &out, const std::string &value)
+{
+	append_uint32(out, static_cast<uint32_t>(value.size()));
+	out.append(value);
+}
+
+std::string sha256_bytes(const std::string &data)
+{
+	unsigned char digest[SHA256_DIGEST_LENGTH];
+	SHA256(reinterpret_cast<const unsigned char *>(data.data()),
+	       data.size(), digest);
+	return std::string(reinterpret_cast<char *>(digest),
+	                   SHA256_DIGEST_LENGTH);
+}
+
+std::string create_host_auth_message(
+    const std::string &client_public_key,
+    const std::string &server_public_key,
+    const std::string &host_public_key)
+{
+	std::string message = "xsh-host-auth-v1";
+	append_string(message, client_public_key);
+	append_string(message, server_public_key);
+	append_string(message, host_public_key);
+	return message;
 }
 
 bool generate_x25519_key(EvpPkeyPtr &key, std::string &public_key)
@@ -325,12 +367,49 @@ bool receive_key_exchange(int socket, std::string &peer_public_key)
 	return true;
 }
 
-bool send_key_exchange(int socket, const std::string &public_key)
+bool send_client_key_exchange(int socket, const std::string &public_key)
 {
 	Packet pkt;
 	pkt.type = MessageType::KEY_EXCHANGE;
 	pkt.content = public_key;
 	return send_raw_packet(socket, pkt);
+}
+
+bool send_server_key_exchange(int socket, const std::string &server_public_key,
+                              const std::string &host_public_key,
+                              const std::string &signature)
+{
+	Packet pkt;
+	pkt.type = MessageType::KEY_EXCHANGE;
+	pkt.content.reserve(1 + server_public_key.size() +
+	                    host_public_key.size() + 4 + signature.size());
+	pkt.content.push_back(static_cast<char>(HOST_AUTH_VERSION));
+	pkt.content.append(server_public_key);
+	pkt.content.append(host_public_key);
+	append_string(pkt.content, signature);
+	return send_raw_packet(socket, pkt);
+}
+
+bool receive_server_key_exchange(int socket, std::string &server_public_key,
+                                 std::string &host_public_key,
+                                 std::string &signature)
+{
+	Packet pkt;
+	if (!read_packet(socket, pkt) || pkt.type != MessageType::KEY_EXCHANGE ||
+	    pkt.content.size() < 1 + X25519_PUBLIC_KEY_SIZE +
+	                             ED25519_PUBLIC_KEY_SIZE + 4 ||
+	    static_cast<unsigned char>(pkt.content[0]) != HOST_AUTH_VERSION) {
+		return false;
+	}
+	size_t offset = 1;
+	server_public_key.assign(pkt.content.data() + offset,
+	                         X25519_PUBLIC_KEY_SIZE);
+	offset += X25519_PUBLIC_KEY_SIZE;
+	host_public_key.assign(pkt.content.data() + offset,
+	                       ED25519_PUBLIC_KEY_SIZE);
+	offset += ED25519_PUBLIC_KEY_SIZE;
+	return read_string(pkt.content, offset, signature) &&
+	       offset == pkt.content.size();
 }
 
 bool finish_handshake(const std::string &shared_secret,
@@ -360,56 +439,105 @@ bool finish_handshake(const std::string &shared_secret,
 	}
 	session.send_seq = 0;
 	session.recv_seq = 0;
+	session.session_id =
+	    sha256_bytes("xsh-session-v1" + client_public_key +
+	                 server_public_key + shared_secret);
 	session.ready = true;
 	return true;
 }
 
 } // namespace
 
-bool perform_client_handshake(int socket, SecureSession &session)
+bool perform_client_handshake(int socket, SecureSession &session,
+                              const std::string &host, int port,
+                              const std::string &known_hosts_path,
+                              std::string &error)
 {
 	EvpPkeyPtr local_key(nullptr, EVP_PKEY_free);
 	std::string client_public_key;
 	if (!generate_x25519_key(local_key, client_public_key) ||
-	    !send_key_exchange(socket, client_public_key)) {
+	    !send_client_key_exchange(socket, client_public_key)) {
+		error = "failed to send key exchange";
 		return false;
 	}
 
 	std::string server_public_key;
-	if (!receive_key_exchange(socket, server_public_key)) {
+	std::string host_public_key;
+	std::string host_signature;
+	if (!receive_server_key_exchange(socket, server_public_key,
+	                                 host_public_key, host_signature)) {
+		error = "failed to receive host-authenticated key exchange";
+		return false;
+	}
+
+	std::string host_message = create_host_auth_message(
+	    client_public_key, server_public_key, host_public_key);
+	if (!verify_ed25519(host_public_key, host_message, host_signature)) {
+		error = "invalid xshd host key signature";
+		return false;
+	}
+	if (!verify_or_record_host_key(known_hosts_path, host, port,
+	                               host_public_key, error)) {
 		return false;
 	}
 
 	std::string shared_secret;
 	if (!derive_shared_secret(local_key.get(), server_public_key,
 	                          shared_secret)) {
+		error = "failed to derive shared secret";
 		return false;
 	}
-	return finish_handshake(shared_secret, client_public_key,
-	                        server_public_key, true, session);
+	if (!finish_handshake(shared_secret, client_public_key,
+	                      server_public_key, true, session)) {
+		error = "failed to derive channel keys";
+		return false;
+	}
+	session.peer_host_public_key = host_public_key;
+	return true;
 }
 
-bool perform_server_handshake(int socket, SecureSession &session)
+bool perform_server_handshake(int socket, SecureSession &session,
+                              IdentityKey &host_identity,
+                              std::string &error)
 {
 	std::string client_public_key;
 	if (!receive_key_exchange(socket, client_public_key)) {
+		error = "failed to receive client key exchange";
 		return false;
 	}
 
 	EvpPkeyPtr local_key(nullptr, EVP_PKEY_free);
 	std::string server_public_key;
-	if (!generate_x25519_key(local_key, server_public_key) ||
-	    !send_key_exchange(socket, server_public_key)) {
+	if (!generate_x25519_key(local_key, server_public_key)) {
+		error = "failed to generate x25519 key";
+		return false;
+	}
+
+	std::string host_message = create_host_auth_message(
+	    client_public_key, server_public_key, host_identity.public_key);
+	std::string host_signature;
+	if (!sign_ed25519(host_identity.key.get(), host_message,
+	                  host_signature) ||
+	    !send_server_key_exchange(socket, server_public_key,
+	                              host_identity.public_key,
+	                              host_signature)) {
+		error = "failed to send host-authenticated key exchange";
 		return false;
 	}
 
 	std::string shared_secret;
 	if (!derive_shared_secret(local_key.get(), client_public_key,
 	                          shared_secret)) {
+		error = "failed to derive shared secret";
 		return false;
 	}
-	return finish_handshake(shared_secret, client_public_key,
-	                        server_public_key, false, session);
+	if (!finish_handshake(shared_secret, client_public_key,
+	                      server_public_key, false, session)) {
+		error = "failed to derive channel keys";
+		return false;
+	}
+	session.peer_host_public_key = host_identity.public_key;
+	return true;
 }
 
 bool send_secure_packet(int socket, SecureSession &session, const Packet &pkt)

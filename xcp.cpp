@@ -17,9 +17,12 @@
 
 #include "include/file_transfer.h"
 #include "include/glog_wrapper.h"
+#include "include/auth_protocol.h"
+#include "include/identity.h"
 #include "include/packet.h"
 #include "include/protocol.h"
 #include "include/secure_channel.h"
+#include "include/utility.h"
 // clang-format on
 
 #define DEFAULT_SERVER_PORT 4468
@@ -27,9 +30,11 @@
 namespace fs = std::filesystem;
 
 std::atomic<bool> g_running(true);
+std::string g_executable_dir;
 
 struct RemotePath {
 	bool remote = false;
+	std::string username;
 	std::string host;
 	std::string path;
 };
@@ -37,6 +42,8 @@ struct RemotePath {
 struct Options {
 	bool show_help = false;
 	int port = DEFAULT_SERVER_PORT;
+	std::string identity_file;
+	std::string known_hosts_file;
 	RemotePath source;
 	RemotePath destination;
 };
@@ -58,6 +65,8 @@ void print_usage(const char *program)
 	    << "\n"
 	    << "Options:\n"
 	    << "  -P PORT           xshd port (default 4468)\n"
+	    << "  -i FILE           Ed25519 identity file\n"
+	    << "  -o OPTION         UserKnownHostsFile=FILE is supported\n"
 	    << "  -h, --help        Show this help\n";
 }
 
@@ -83,13 +92,17 @@ bool parse_port(const std::string &value, int &port)
 	}
 }
 
-std::string host_part(const std::string &destination)
+void split_remote_host(const std::string &destination,
+                       std::string &username, std::string &host)
 {
 	size_t at_pos = destination.rfind('@');
 	if (at_pos == std::string::npos) {
-		return destination;
+		username.clear();
+		host = destination;
+		return;
 	}
-	return destination.substr(at_pos + 1);
+	username = destination.substr(0, at_pos);
+	host = destination.substr(at_pos + 1);
 }
 
 RemotePath parse_path(const std::string &value)
@@ -111,9 +124,28 @@ RemotePath parse_path(const std::string &value)
 	}
 
 	parsed.remote = true;
-	parsed.host = host_part(maybe_host);
+	split_remote_host(maybe_host, parsed.username, parsed.host);
 	parsed.path = maybe_path;
 	return parsed;
+}
+
+bool apply_option(const std::string &option, Options &options)
+{
+	auto equals = option.find('=');
+	std::string key = equals == std::string::npos
+	                      ? option
+	                      : option.substr(0, equals);
+	std::string value = equals == std::string::npos
+	                        ? ""
+	                        : option.substr(equals + 1);
+	if (key == "UserKnownHostsFile") {
+		if (value.empty()) {
+			std::cerr << "xcp: invalid UserKnownHostsFile\n";
+			return false;
+		}
+		options.known_hosts_file = value;
+	}
+	return true;
 }
 
 bool parse_arguments(int argc, char *argv[], Options &options)
@@ -128,8 +160,19 @@ bool parse_arguments(int argc, char *argv[], Options &options)
 			options.show_help = true;
 			return true;
 		}
-		if (arg == "-P") {
-			if (++i >= argc || !parse_port(argv[i], options.port)) {
+		if (arg == "-P" || arg == "-i" || arg == "-o") {
+			if (++i >= argc) {
+				std::cerr << "xcp: " << arg << " requires an argument\n";
+				return false;
+			}
+			if (arg == "-i") {
+				options.identity_file = argv[i];
+				continue;
+			}
+			if (arg == "-o") {
+				return apply_option(argv[i], options);
+			}
+			if (!parse_port(argv[i], options.port)) {
 				std::cerr << "xcp: invalid port\n";
 				return false;
 			}
@@ -154,6 +197,7 @@ bool parse_arguments(int argc, char *argv[], Options &options)
 }
 
 bool connect_secure(const std::string &host, int port, int &socket_fd,
+                    const std::string &known_hosts_path,
                     SecureSession &secure_session)
 {
 	struct addrinfo hints;
@@ -192,9 +236,60 @@ bool connect_secure(const std::string &host, int port, int &socket_fd,
 		return false;
 	}
 
-	if (!perform_client_handshake(socket_fd, secure_session)) {
-		std::cerr << "xcp: secure handshake failed\n";
+	std::string error;
+	if (!perform_client_handshake(socket_fd, secure_session, host, port,
+	                              known_hosts_path, error)) {
+		std::cerr << "xcp: secure handshake failed: " << error << "\n";
 		close(socket_fd);
+		return false;
+	}
+	return true;
+}
+
+bool authenticate_user(int socket_fd, SecureSession &secure_session,
+                       const std::string &username,
+                       const std::string &identity_file)
+{
+	IdentityKey identity;
+	std::string error;
+	if (!load_or_create_ed25519_key(identity_file, identity, error)) {
+		std::cerr << "xcp: " << error << "\n";
+		return false;
+	}
+
+	std::string message = create_user_auth_message(
+	    secure_session.session_id, username, identity.public_key);
+	std::string signature;
+	if (!sign_ed25519(identity.key.get(), message, signature)) {
+		std::cerr << "xcp: failed to sign authentication request\n";
+		return false;
+	}
+
+	Packet request;
+	request.type = MessageType::AUTH_REQUEST;
+	request.content = create_auth_request_payload(
+	    username, identity.public_key, signature);
+	if (!send_secure_packet(socket_fd, secure_session, request)) {
+		std::cerr << "xcp: failed to send authentication request\n";
+		return false;
+	}
+
+	Packet response;
+	if (!read_secure_packet(socket_fd, secure_session, response) ||
+	    response.type != MessageType::AUTH_RESULT) {
+		std::cerr << "xcp: authentication failed: invalid response\n";
+		return false;
+	}
+	AuthResultPayload result;
+	if (!parse_auth_result_payload(response.content, result) ||
+	    !result.success) {
+		std::cerr << "xcp: authentication failed";
+		if (!result.message.empty()) {
+			std::cerr << ": " << result.message;
+		}
+		std::cerr << "\n";
+		std::cerr << "xcp: public key: ed25519 "
+		          << hex_encode(identity.public_key) << "\n";
 		return false;
 	}
 	return true;
@@ -341,6 +436,13 @@ bool receive_file_download(int socket_fd, SecureSession &secure_session,
 	}
 
 	fs::path output_path = destination;
+	if (output_path.is_relative()) {
+		output_path = fs::path(g_executable_dir) / output_path;
+	}
+	std::error_code ec;
+	if (output_path.has_parent_path()) {
+		fs::create_directories(output_path.parent_path(), ec);
+	}
 	std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
 	if (!output.is_open()) {
 		std::cerr << "xcp: failed to open destination file\n";
@@ -405,14 +507,34 @@ int main(int argc, char *argv[])
 	}
 
 	auto glog = GlogWrapper(argv[0], false);
+	g_executable_dir = executable_dir(argv[0]);
+	set_default_config_dir((fs::path(g_executable_dir) / "xsh-data").string());
+	if (options.identity_file.empty()) {
+		options.identity_file = default_user_key_path();
+	}
+	if (options.known_hosts_file.empty()) {
+		options.known_hosts_file = default_known_hosts_path();
+	}
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
 
 	std::string host = options.source.remote ? options.source.host
 	                                         : options.destination.host;
+	std::string username = options.source.remote ? options.source.username
+	                                             : options.destination.username;
+	if (username.empty()) {
+		username = default_username();
+	}
 	int socket_fd = -1;
 	SecureSession secure_session;
-	if (!connect_secure(host, options.port, socket_fd, secure_session)) {
+	if (!connect_secure(host, options.port, socket_fd,
+	                    options.known_hosts_file, secure_session)) {
+		return 1;
+	}
+	if (!authenticate_user(socket_fd, secure_session, username,
+	                       options.identity_file)) {
+		shutdown(socket_fd, SHUT_RDWR);
+		close(socket_fd);
 		return 1;
 	}
 

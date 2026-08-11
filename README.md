@@ -6,7 +6,19 @@ This branch packages the encrypted TCP transport as focused command-line tools:
 - `xsh`: ssh-like one-off remote command execution
 - `xcp`: scp-like file copy
 
-All application traffic runs inside the encrypted channel.
+All application traffic runs inside the encrypted channel. `xshd` has a
+persistent Ed25519 host key, and `xsh`/`xcp` verify it through a
+known-hosts file. Users authenticate with Ed25519 public keys listed in
+`authorized_keys`.
+
+Runtime state is stored beside the executable, not in the user's home
+directory:
+
+- `<exe-dir>/logs/`
+- `<exe-dir>/xsh-data/known_hosts`
+- `<exe-dir>/xsh-data/id_ed25519`
+- `<exe-dir>/xsh-data/xshd_host_ed25519`
+- `<exe-dir>/xsh-data/authorized_keys`
 
 ## Build
 
@@ -23,6 +35,16 @@ Run the daemon on the controlled host:
 ./build/xshd
 ```
 
+On first start, `xshd` creates its host key at
+`./build/xsh-data/xshd_host_ed25519`. On first client use, `xsh` creates a user
+key at `./build/xsh-data/id_ed25519` and prints its public key if it is not
+authorized yet. Add that public key to the controlled host's
+`./build/xsh-data/authorized_keys`:
+
+```text
+username ed25519 <hex-public-key>
+```
+
 Run commands from another machine:
 
 ```sh
@@ -33,7 +55,12 @@ printf 'hello' | ./build/xsh 192.168.0.107 wc -c
 ```
 
 `xsh` writes remote stdout and stderr to local stdout and stderr, and exits with
-the remote command exit code.
+the remote command exit code. The first successful host-key observation is
+recorded in `<exe-dir>/xsh-data/known_hosts`; later host-key changes are
+rejected.
+
+The `user@host` user is authenticated and authorized against `authorized_keys`.
+Commands currently run as the OS user that started `xshd`.
 
 ## File Copy
 
@@ -50,6 +77,7 @@ Download a remote file:
 ```
 
 `xcp` prints transfer progress and ETA to stderr.
+Relative download destinations are written under the executable directory.
 
 ## Reference
 

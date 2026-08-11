@@ -3,9 +3,9 @@ project(socket CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 
-add_executable(xshd xshd.cpp protocol.cpp secure_channel.cpp shell_exec.cpp)
-add_executable(xsh xsh.cpp protocol.cpp secure_channel.cpp shell_exec.cpp)
-add_executable(xcp xcp.cpp protocol.cpp secure_channel.cpp)
+add_executable(xshd xshd.cpp protocol.cpp secure_channel.cpp shell_exec.cpp identity.cpp auth_protocol.cpp)
+add_executable(xsh xsh.cpp protocol.cpp secure_channel.cpp shell_exec.cpp identity.cpp auth_protocol.cpp)
+add_executable(xcp xcp.cpp protocol.cpp secure_channel.cpp identity.cpp auth_protocol.cpp)
 
 find_package(glog REQUIRED)
 target_link_libraries(xshd PRIVATE glog::glog)

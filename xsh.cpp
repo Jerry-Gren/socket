@@ -15,10 +15,13 @@
 #include <unistd.h>
 
 #include "include/glog_wrapper.h"
+#include "include/auth_protocol.h"
+#include "include/identity.h"
 #include "include/packet.h"
 #include "include/protocol.h"
 #include "include/secure_channel.h"
 #include "include/shell_exec.h"
+#include "include/utility.h"
 // clang-format on
 
 #define DEFAULT_SERVER_ADDRESS "127.0.0.1"
@@ -38,6 +41,9 @@ struct RemoteExecOptions {
 	uint32_t timeout_seconds = 0;
 	int port = DEFAULT_SERVER_PORT;
 	std::string host = DEFAULT_SERVER_ADDRESS;
+	std::string username;
+	std::string identity_file;
+	std::string known_hosts_file;
 	std::string destination;
 	std::string command;
 };
@@ -58,12 +64,13 @@ void print_usage(const char *program)
 	    << "\n"
 	    << "Options:\n"
 	    << "  -p PORT           xshd port (default 4468)\n"
-	    << "  -l USER           Accept ssh-style login name; currently ignored\n"
+	    << "  -l USER           Login user\n"
+	    << "  -i FILE           Ed25519 identity file\n"
 	    << "  -n                Do not read from stdin\n"
 	    << "  -T                Disable pseudo-terminal allocation\n"
 	    << "  -t                Accepted for ssh compatibility; PTY is not implemented\n"
 	    << "  -q                Quiet mode\n"
-	    << "  -o OPTION         RemoteCommandTimeout=N is supported\n"
+	    << "  -o OPTION         RemoteCommandTimeout=N and UserKnownHostsFile=FILE are supported\n"
 	    << "  -h, --help        Show this help\n";
 }
 
@@ -134,6 +141,12 @@ bool apply_option(const std::string &option, RemoteExecOptions &options)
 			return false;
 		}
 		options.timeout_seconds = static_cast<uint32_t>(timeout);
+	} else if (key == "UserKnownHostsFile") {
+		if (value.empty()) {
+			std::cerr << "Invalid UserKnownHostsFile\n";
+			return false;
+		}
+		options.known_hosts_file = value;
 	}
 	return true;
 }
@@ -142,7 +155,6 @@ bool parse_arguments(int argc, char *argv[], RemoteExecOptions &options)
 {
 	int i = 1;
 	bool options_done = false;
-	std::string login_name;
 
 	for (; i < argc; ++i) {
 		std::string arg = argv[i];
@@ -157,7 +169,7 @@ bool parse_arguments(int argc, char *argv[], RemoteExecOptions &options)
 			options.show_help = true;
 			return true;
 		}
-		if (arg == "-p" || arg == "-l" || arg == "-o") {
+		if (arg == "-p" || arg == "-l" || arg == "-i" || arg == "-o") {
 			if (++i >= argc) {
 				std::cerr << arg << " requires an argument\n";
 				return false;
@@ -170,7 +182,9 @@ bool parse_arguments(int argc, char *argv[], RemoteExecOptions &options)
 				}
 				options.port = port;
 			} else if (arg == "-l") {
-				login_name = argv[i];
+				options.username = argv[i];
+			} else if (arg == "-i") {
+				options.identity_file = argv[i];
 			} else if (!apply_option(argv[i], options)) {
 				return false;
 			}
@@ -210,11 +224,19 @@ bool parse_arguments(int argc, char *argv[], RemoteExecOptions &options)
 
 	options.destination = argv[i];
 	options.host = destination_host_part(options.destination);
+	size_t at_pos = options.destination.rfind('@');
+	if (at_pos != std::string::npos && options.username.empty()) {
+		options.username = options.destination.substr(0, at_pos);
+	}
+	if (options.username.empty()) {
+		options.username = default_username();
+	}
 	options.command = join_command_arguments(i + 1, argc, argv);
 	return !options.host.empty() && !options.command.empty();
 }
 
 bool connect_secure(const std::string &host, int port, int &socket_fd,
+                    const std::string &known_hosts_path,
                     SecureSession &secure_session)
 {
 	struct addrinfo hints;
@@ -253,9 +275,59 @@ bool connect_secure(const std::string &host, int port, int &socket_fd,
 		return false;
 	}
 
-	if (!perform_client_handshake(socket_fd, secure_session)) {
-		std::cerr << "xsh: secure handshake failed\n";
+	std::string error;
+	if (!perform_client_handshake(socket_fd, secure_session, host, port,
+	                              known_hosts_path, error)) {
+		std::cerr << "xsh: secure handshake failed: " << error << "\n";
 		close(socket_fd);
+		return false;
+	}
+	return true;
+}
+
+bool authenticate_user(int socket_fd, SecureSession &secure_session,
+                       const RemoteExecOptions &options)
+{
+	IdentityKey identity;
+	std::string error;
+	if (!load_or_create_ed25519_key(options.identity_file, identity, error)) {
+		std::cerr << "xsh: " << error << "\n";
+		return false;
+	}
+
+	std::string message = create_user_auth_message(
+	    secure_session.session_id, options.username, identity.public_key);
+	std::string signature;
+	if (!sign_ed25519(identity.key.get(), message, signature)) {
+		std::cerr << "xsh: failed to sign authentication request\n";
+		return false;
+	}
+
+	Packet request;
+	request.type = MessageType::AUTH_REQUEST;
+	request.content = create_auth_request_payload(
+	    options.username, identity.public_key, signature);
+	if (!send_secure_packet(socket_fd, secure_session, request)) {
+		std::cerr << "xsh: failed to send authentication request\n";
+		return false;
+	}
+
+	Packet response;
+	if (!read_secure_packet(socket_fd, secure_session, response) ||
+	    response.type != MessageType::AUTH_RESULT) {
+		std::cerr << "xsh: authentication failed: invalid response\n";
+		return false;
+	}
+	AuthResultPayload result;
+	if (!parse_auth_result_payload(response.content, result) ||
+	    !result.success) {
+		std::cerr << "xsh: authentication failed";
+		if (!result.message.empty()) {
+			std::cerr << ": " << result.message;
+		}
+		std::cerr << "\n";
+		std::cerr << "xsh: public key: ed25519 "
+		          << hex_encode(identity.public_key) << "\n";
 		return false;
 	}
 	return true;
@@ -402,6 +474,13 @@ int main(int argc, char *argv[])
 	}
 
 	auto glog = GlogWrapper(argv[0], false);
+	set_default_config_dir(path_under_executable_dir(argv[0], "xsh-data"));
+	if (options.identity_file.empty()) {
+		options.identity_file = default_user_key_path();
+	}
+	if (options.known_hosts_file.empty()) {
+		options.known_hosts_file = default_known_hosts_path();
+	}
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
 	signal(SIGPIPE, SIG_IGN);
@@ -409,7 +488,13 @@ int main(int argc, char *argv[])
 	int socket_fd = -1;
 	SecureSession secure_session;
 	if (!connect_secure(options.host, options.port, socket_fd,
+	                    options.known_hosts_file,
 	                    secure_session)) {
+		return 255;
+	}
+	if (!authenticate_user(socket_fd, secure_session, options)) {
+		shutdown(socket_fd, SHUT_RDWR);
+		close(socket_fd);
 		return 255;
 	}
 

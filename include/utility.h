@@ -2,6 +2,7 @@
 #define UTILITY_H_
 
 #include <string>
+#include <filesystem>
 
 /**
  * @brief Sanitizes a string to prevent terminal injection.
@@ -20,6 +21,29 @@ inline std::string sanitize_for_terminal(std::string input) {
 		pos = input.find('\x1b', pos + 5);
 	}
 	return input;
+}
+
+inline std::string executable_dir(const char *program)
+{
+	std::error_code ec;
+	std::filesystem::path path(program ? program : ".");
+	if (!path.is_absolute()) {
+		path = std::filesystem::absolute(path, ec);
+		if (ec) {
+			return ".";
+		}
+	}
+	path = std::filesystem::weakly_canonical(path, ec);
+	if (ec) {
+		path = std::filesystem::absolute(program ? program : ".", ec);
+	}
+	return path.parent_path().string();
+}
+
+inline std::string path_under_executable_dir(const char *program,
+                                             const std::string &relative)
+{
+	return (std::filesystem::path(executable_dir(program)) / relative).string();
 }
 
 #endif // UTILITY_H_

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cctype>
 #include <condition_variable>
 #include <csignal>
 #include <cstring>
@@ -25,10 +26,13 @@
 
 #include "include/file_transfer.h"
 #include "include/glog_wrapper.h"
+#include "include/auth_protocol.h"
+#include "include/identity.h"
 #include "include/packet.h"
 #include "include/protocol.h"
 #include "include/secure_channel.h"
 #include "include/shell_exec.h"
+#include "include/utility.h"
 // clang-format on
 
 namespace fs = std::filesystem;
@@ -58,10 +62,84 @@ struct ShellInputQueue {
 std::mutex g_shell_input_mutex;
 std::map<ShellInputKey, std::shared_ptr<ShellInputQueue>> g_shell_inputs;
 
+struct ServerOptions {
+	int port = SERVER_PORT;
+	std::string host_key_path;
+	std::string authorized_keys_path;
+};
+
 void signal_handler(int signum)
 {
 	LOG(INFO) << "[Info] Signal " << signum << " received. Shutting down...";
 	g_server_running = false;
+}
+
+void print_usage(const char *program)
+{
+	std::cerr
+	    << "Usage:\n"
+	    << "  " << program << " [options]\n"
+	    << "\n"
+	    << "Options:\n"
+	    << "  -p PORT                 Listen port (default 4468)\n"
+	    << "  --host-key FILE         xshd Ed25519 host key\n"
+	    << "  --authorized-keys FILE  Authorized user public keys\n"
+	    << "  -h, --help              Show this help\n";
+}
+
+bool parse_port(const std::string &value, int &port)
+{
+	if (value.empty()) {
+		return false;
+	}
+	for (unsigned char ch : value) {
+		if (!std::isdigit(ch)) {
+			return false;
+		}
+	}
+	try {
+		int parsed = std::stoi(value);
+		if (parsed < 1 || parsed > 65535) {
+			return false;
+		}
+		port = parsed;
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+bool parse_arguments(int argc, char *argv[], ServerOptions &options,
+                     bool &show_help)
+{
+	for (int i = 1; i < argc; ++i) {
+		std::string arg = argv[i];
+		if (arg == "-h" || arg == "--help") {
+			show_help = true;
+			return true;
+		}
+		if (arg == "-p" || arg == "--host-key" ||
+		    arg == "--authorized-keys") {
+			if (++i >= argc) {
+				std::cerr << "xshd: " << arg << " requires an argument\n";
+				return false;
+			}
+			if (arg == "-p") {
+				if (!parse_port(argv[i], options.port)) {
+					std::cerr << "xshd: invalid port\n";
+					return false;
+				}
+			} else if (arg == "--host-key") {
+				options.host_key_path = argv[i];
+			} else {
+				options.authorized_keys_path = argv[i];
+			}
+			continue;
+		}
+		std::cerr << "xshd: unsupported option: " << arg << "\n";
+		return false;
+	}
+	return true;
 }
 
 std::shared_ptr<ShellInputQueue> register_shell_input_queue(
@@ -145,6 +223,55 @@ bool send_packet_locked(int socket, SecureSession &secure_session,
 {
 	std::lock_guard<std::mutex> lock(send_mutex);
 	return send_secure_packet(socket, secure_session, pkt);
+}
+
+void send_auth_result(int socket, SecureSession &secure_session,
+                      std::mutex &send_mutex, bool success,
+                      const std::string &message)
+{
+	Packet pkt;
+	pkt.type = MessageType::AUTH_RESULT;
+	pkt.content = create_auth_result_payload(success, message);
+	send_packet_locked(socket, secure_session, send_mutex, pkt);
+}
+
+bool authenticate_connection(int socket, SecureSession &secure_session,
+                             std::mutex &send_mutex,
+                             const std::string &authorized_keys_path)
+{
+	Packet pkt;
+	if (!read_secure_packet(socket, secure_session, pkt) ||
+	    pkt.type != MessageType::AUTH_REQUEST) {
+		send_auth_result(socket, secure_session, send_mutex, false,
+		                 "authentication required");
+		return false;
+	}
+
+	AuthRequestPayload request;
+	if (!parse_auth_request_payload(pkt.content, request)) {
+		send_auth_result(socket, secure_session, send_mutex, false,
+		                 "invalid authentication request");
+		return false;
+	}
+
+	std::string message = create_user_auth_message(
+	    secure_session.session_id, request.username, request.public_key);
+	if (!verify_ed25519(request.public_key, message, request.signature)) {
+		send_auth_result(socket, secure_session, send_mutex, false,
+		                 "invalid signature");
+		return false;
+	}
+
+	std::string error;
+	if (!is_authorized_user_key(authorized_keys_path, request.username,
+	                            request.public_key, error)) {
+		send_auth_result(socket, secure_session, send_mutex, false, error);
+		return false;
+	}
+
+	send_auth_result(socket, secure_session, send_mutex, true, "accepted");
+	LOG(INFO) << "[Auth] Accepted user " << request.username;
+	return true;
 }
 
 void send_file_result(int socket, SecureSession &secure_session,
@@ -366,10 +493,16 @@ void handle_file_get_request(int socket, SecureSession &secure_session,
 }
 
 void handle_connection(int socket, SecureSession secure_session,
-                       uint64_t connection_id)
+                       uint64_t connection_id,
+                       const std::string &authorized_keys_path)
 {
 	std::mutex send_mutex;
 	std::map<uint64_t, std::ofstream> uploads;
+
+	if (!authenticate_connection(socket, secure_session, send_mutex,
+	                             authorized_keys_path)) {
+		return;
+	}
 
 	while (g_server_running) {
 		Packet pkt;
@@ -410,14 +543,39 @@ void handle_connection(int socket, SecureSession secure_session,
 int main(int argc, char *argv[])
 {
 	auto glog = GlogWrapper(argv[0]);
+	set_default_config_dir(path_under_executable_dir(argv[0], "xsh-data"));
+
+	ServerOptions options;
+	bool show_help = false;
+	if (!parse_arguments(argc, argv, options, show_help)) {
+		print_usage(argv[0]);
+		return 2;
+	}
+	if (show_help) {
+		print_usage(argv[0]);
+		return 0;
+	}
+	if (options.host_key_path.empty()) {
+		options.host_key_path = default_host_key_path();
+	}
+	if (options.authorized_keys_path.empty()) {
+		options.authorized_keys_path = default_authorized_keys_path();
+	}
+
+	IdentityKey host_identity;
+	std::string identity_error;
+	if (!load_or_create_ed25519_key(options.host_key_path, host_identity,
+	                                identity_error)) {
+		LOG(ERROR) << "[Error] " << identity_error;
+		return 1;
+	}
+	LOG(INFO) << "[Info] Host key SHA256:"
+	          << fingerprint_sha256(host_identity.public_key);
+	LOG(INFO) << "[Info] Authorized keys: "
+	          << options.authorized_keys_path;
 
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
-
-	int port = SERVER_PORT;
-	if (argc == 3 && std::string(argv[1]) == "-p") {
-		port = std::stoi(argv[2]);
-	}
 
 	int server_socket = socket(AF_INET, SOCK_STREAM, 0);
 	if (server_socket < 0) {
@@ -432,7 +590,7 @@ int main(int argc, char *argv[])
 	memset(&server_address, 0, sizeof(server_address));
 	server_address.sin_family = AF_INET;
 	server_address.sin_addr.s_addr = INADDR_ANY;
-	server_address.sin_port = htons(port);
+	server_address.sin_port = htons(options.port);
 
 	if (bind(server_socket, (struct sockaddr *)&server_address,
 	         sizeof(server_address)) < 0) {
@@ -447,7 +605,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	LOG(INFO) << "[Info] Server is listening on port " << port << "...";
+	LOG(INFO) << "[Info] xshd is listening on port " << options.port << "...";
 	std::atomic<uint64_t> next_connection_id(1);
 
 	while (g_server_running) {
@@ -479,15 +637,21 @@ int main(int argc, char *argv[])
 		}
 
 		SecureSession secure_session;
-		if (!perform_server_handshake(client_socket, secure_session)) {
-			LOG(ERROR) << "[Error] Secure handshake failed";
+		std::string handshake_error;
+		if (!perform_server_handshake(client_socket, secure_session,
+		                              host_identity, handshake_error)) {
+			LOG(ERROR) << "[Error] Secure handshake failed: "
+			           << handshake_error;
 			close(client_socket);
 			continue;
 		}
 
 		uint64_t connection_id = next_connection_id.fetch_add(1);
-		std::thread([client_socket, secure_session, connection_id]() mutable {
-			handle_connection(client_socket, secure_session, connection_id);
+		std::string authorized_keys_path = options.authorized_keys_path;
+		std::thread([client_socket, secure_session, connection_id,
+		             authorized_keys_path]() mutable {
+			handle_connection(client_socket, secure_session, connection_id,
+			                  authorized_keys_path);
 			shutdown(client_socket, SHUT_RDWR);
 			close(client_socket);
 		}).detach();
