@@ -6,11 +6,13 @@
 #include <sys/socket.h>    // For socket functions
 #include <netinet/in.h>    // For sockaddr_in
 #include <thread>          // For threading
+#include <mutex>           // For std::mutex
 #include <csignal>         // For signal handling
 #include <atomic>          // For std::atomic
 #include <sys/select.h>    // For select()
 #include <cerrno>          // For errno
 #include <nlohmann/json.hpp>
+#include <map>
 
 #include <chrono>
 #include <iomanip>
@@ -180,6 +182,58 @@ void handle_send_file_request(int client_id, const std::string &content)
 	}
 }
 
+void log_received_packet(int client_id, const Packet &pkt)
+{
+	if (pkt.type != MessageType::SEND_FILE_REQUEST) {
+		LOG(INFO) << "Received from ID " << client_id
+		          << ", Type: " << MessageTypeToString(pkt.type)
+		          << ", Payload: " << sanitize_for_terminal(pkt.content);
+		return;
+	}
+
+	try {
+		json data = json::parse(pkt.content);
+		uint64_t total_size = data.value("total_size", 0);
+		uint64_t bytes_sent = data.value("bytes_sent", 0);
+		uint64_t target_id = data.value("target_id", 0);
+		std::string filename = data.value("filename", "");
+		bool is_eof = data.value("eof", false);
+
+		int progress_percent = 0;
+		if (total_size > 0) {
+			if (bytes_sent > total_size) {
+				bytes_sent = total_size;
+			}
+			progress_percent = static_cast<int>(
+			    (static_cast<long double>(bytes_sent) * 100.0L) /
+			    static_cast<long double>(total_size));
+		}
+		if (is_eof) {
+			progress_percent = 100;
+		}
+
+		static std::map<std::string, int> last_progress_by_transfer;
+		static std::mutex progress_log_mutex;
+		std::string transfer_key = std::to_string(client_id) + ":" +
+		                           std::to_string(target_id) + ":" + filename;
+		std::lock_guard<std::mutex> lock(progress_log_mutex);
+		auto last_progress = last_progress_by_transfer.find(transfer_key);
+		if (last_progress == last_progress_by_transfer.end() ||
+		    last_progress->second != progress_percent) {
+			std::cout << "\r\x1b[2K[File Transfer] "
+			          << progress_percent << "%" << std::flush;
+			last_progress_by_transfer[transfer_key] = progress_percent;
+		}
+		if (is_eof) {
+			std::cout << std::endl;
+			last_progress_by_transfer.erase(transfer_key);
+		}
+	} catch (const json::exception &e) {
+		LOG(WARNING) << "[File Transfer] Failed to parse progress from client "
+		             << client_id << ": " << e.what();
+	}
+}
+
 void handle_unhandled_request(int client_id, MessageType type, const std::string &content)
 {
 	LOG(WARNING) << "[Warning] Unhandled message type from client " << client_id
@@ -221,9 +275,7 @@ void handle_client(int client_id, int client_socket)
 			          << " connection closed or errored.";
 			break;
 		}
-		LOG(INFO) << "Received from ID " << client_id
-		          << ", Type: " << MessageTypeToString(received_pkt.type)
-		          << ", Payload: " << sanitize_for_terminal(received_pkt.content);
+		log_received_packet(client_id, received_pkt);
 
 		switch (received_pkt.type) {
 		case MessageType::GET_TIME_REQUEST:

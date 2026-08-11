@@ -267,6 +267,24 @@ bool send_packet(int socket, const Packet &pkt)
 	return true;
 }
 
+size_t calculate_file_chunk_size(uint64_t total_size)
+{
+	const size_t MAX_FILE_CHUNK_SIZE = 40 * 1024;
+	if (total_size == 0) {
+		return 1;
+	}
+
+	size_t one_percent_chunk =
+	    static_cast<size_t>((total_size + 99) / 100);
+	if (one_percent_chunk == 0) {
+		return 1;
+	}
+	if (one_percent_chunk > MAX_FILE_CHUNK_SIZE) {
+		return MAX_FILE_CHUNK_SIZE;
+	}
+	return one_percent_chunk;
+}
+
 void on_command_get_time(int socket)
 {
 	LOG(INFO) << "[Cmd] Requesting server time...";
@@ -363,14 +381,17 @@ void on_command_send_file(int socket)
 
     std::string filename = fs::path(filepath).filename().string();
     std::ifstream file(filepath, std::ios::binary);
+    uint64_t total_size = fs::file_size(filepath);
+    uint64_t bytes_sent = 0;
 
-    const size_t CHUNK_SIZE = 32 * 1024;
-    std::vector<char> buffer(CHUNK_SIZE);
+    size_t chunk_size = calculate_file_chunk_size(total_size);
+    std::vector<char> buffer(chunk_size);
 
     LOG(INFO) << "[Cmd] Starting file transfer: " << filename;
 
-    while (file.read(buffer.data(), CHUNK_SIZE) || file.gcount() > 0) {
+    while (file.read(buffer.data(), chunk_size) || file.gcount() > 0) {
         size_t bytes_read = file.gcount();
+        bytes_sent += bytes_read;
         std::vector<char> chunk_data(buffer.begin(), buffer.begin() + bytes_read);
 
         std::string encoded_data = base64_encode(chunk_data);
@@ -380,13 +401,13 @@ void on_command_send_file(int socket)
         pkt.content = json{
             {"target_id", target_id},
             {"filename", filename},
+            {"total_size", total_size},
+            {"bytes_sent", bytes_sent},
             {"data", encoded_data},
             {"eof", false}
         }.dump();
 
         if (!send_packet(socket, pkt)) return;
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     Packet end_pkt;
@@ -394,6 +415,8 @@ void on_command_send_file(int socket)
     end_pkt.content = json{
         {"target_id", target_id},
         {"filename", filename},
+        {"total_size", total_size},
+        {"bytes_sent", total_size},
         {"data", ""},
         {"eof", true}
     }.dump();
