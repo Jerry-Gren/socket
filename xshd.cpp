@@ -15,12 +15,17 @@
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <pwd.h>
+#include <grp.h>
 #include <sstream>
 #include <string>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #define SERVER_PORT 4468
 #define MAX_CLIENT_QUEUE 20
@@ -67,6 +72,30 @@ struct ServerOptions {
 	int port = SERVER_PORT;
 	std::string host_key_path;
 	std::string authorized_keys_path;
+};
+
+struct AuthenticatedUser {
+	std::string username;
+	uid_t uid = 0;
+	gid_t gid = 0;
+	std::string home;
+};
+
+struct TransferEntry {
+	fs::path path;
+	std::string relative_path;
+	FileEntryType type = FileEntryType::REGULAR_FILE;
+	uint32_t mode = 0644;
+	uint64_t size = 0;
+};
+
+struct UploadState {
+	fs::path base_path;
+	bool recursive = false;
+	std::ofstream stream;
+	fs::path open_path;
+	uint32_t open_mode = 0644;
+	std::vector<std::pair<fs::path, uint32_t>> directories;
 };
 
 void signal_handler(int signum)
@@ -236,9 +265,82 @@ void send_auth_result(int socket, SecureSession &secure_session,
 	send_packet_locked(socket, secure_session, send_mutex, pkt);
 }
 
+bool resolve_os_user(const std::string &username, AuthenticatedUser &user,
+                     std::string &error)
+{
+	if (username.empty()) {
+		error = "empty username";
+		return false;
+	}
+
+	struct passwd pwd;
+	struct passwd *result = nullptr;
+	long buffer_size = sysconf(_SC_GETPW_R_SIZE_MAX);
+	if (buffer_size < 1024) {
+		buffer_size = 16384;
+	}
+	std::vector<char> buffer(static_cast<size_t>(buffer_size));
+	int rc = getpwnam_r(username.c_str(), &pwd, buffer.data(),
+	                    buffer.size(), &result);
+	if (rc != 0 || result == nullptr) {
+		error = "unknown OS user: " + username;
+		return false;
+	}
+
+	user.username = username;
+	user.uid = pwd.pw_uid;
+	user.gid = pwd.pw_gid;
+	user.home = pwd.pw_dir == nullptr ? "" : pwd.pw_dir;
+	return true;
+}
+
+bool drop_to_user(const AuthenticatedUser &user, std::string &error)
+{
+	if (geteuid() == user.uid) {
+		if (!user.home.empty()) {
+			setenv("HOME", user.home.c_str(), 1);
+		}
+		setenv("USER", user.username.c_str(), 1);
+		setenv("LOGNAME", user.username.c_str(), 1);
+		return true;
+	}
+	if (geteuid() != 0) {
+		error = "xshd is not running as root and cannot switch to user " +
+		        user.username;
+		return false;
+	}
+
+	if (initgroups(user.username.c_str(), user.gid) != 0) {
+		error = "initgroups failed for " + user.username + ": " +
+		        strerror(errno);
+		return false;
+	}
+	if (setgid(user.gid) != 0) {
+		error = "setgid failed for " + user.username + ": " +
+		        strerror(errno);
+		return false;
+	}
+	if (setuid(user.uid) != 0) {
+		error = "setuid failed for " + user.username + ": " +
+		        strerror(errno);
+		return false;
+	}
+	if (setuid(0) == 0) {
+		error = "failed to permanently drop root privileges";
+		return false;
+	}
+	if (!user.home.empty()) {
+		setenv("HOME", user.home.c_str(), 1);
+	}
+	setenv("USER", user.username.c_str(), 1);
+	setenv("LOGNAME", user.username.c_str(), 1);
+	return true;
+}
+
 bool authenticate_connection(int socket, SecureSession &secure_session,
                              std::mutex &send_mutex,
-                             const std::string &authorized_keys_path)
+                             const std::string &authorized_keys_path,
+                             AuthenticatedUser &user)
 {
 	Packet pkt;
 	if (!read_secure_packet(socket, secure_session, pkt) ||
@@ -270,8 +372,18 @@ bool authenticate_connection(int socket, SecureSession &secure_session,
 		return false;
 	}
 
+	if (!resolve_os_user(request.username, user, error)) {
+		send_auth_result(socket, secure_session, send_mutex, false, error);
+		return false;
+	}
+	if (!drop_to_user(user, error)) {
+		send_auth_result(socket, secure_session, send_mutex, false, error);
+		return false;
+	}
+
 	send_auth_result(socket, secure_session, send_mutex, true, "accepted");
-	LOG(INFO) << "[Auth] Accepted user " << request.username;
+	LOG(INFO) << "[Auth] Accepted user " << request.username
+	          << " uid=" << user.uid;
 	return true;
 }
 
@@ -365,7 +477,263 @@ fs::path expand_remote_path(const std::string &path)
 	return fs::path(path);
 }
 
-void handle_file_put_request(std::map<uint64_t, std::ofstream> &uploads,
+bool is_safe_relative_path(const std::string &relative_path)
+{
+	if (relative_path.empty()) {
+		return true;
+	}
+	fs::path path(relative_path);
+	if (path.is_absolute()) {
+		return false;
+	}
+	for (const auto &part : path) {
+		if (part == "..") {
+			return false;
+		}
+	}
+	return true;
+}
+
+fs::path target_for_entry(const fs::path &base_path,
+                          const std::string &relative_path)
+{
+	if (relative_path.empty()) {
+		return base_path;
+	}
+	return base_path / fs::path(relative_path);
+}
+
+bool chmod_path(const fs::path &path, uint32_t mode, std::string &error)
+{
+	std::error_code ec;
+	fs::permissions(path, static_cast<fs::perms>(mode & 07777),
+	                fs::perm_options::replace, ec);
+	if (ec) {
+		error = "failed to set permissions on " + path.string() + ": " +
+		        ec.message();
+		return false;
+	}
+	return true;
+}
+
+bool close_open_upload_file(UploadState &state, std::string &error)
+{
+	if (!state.stream.is_open()) {
+		return true;
+	}
+	state.stream.close();
+	if (!state.stream.good()) {
+		error = "failed to close destination file";
+		return false;
+	}
+	return chmod_path(state.open_path, state.open_mode, error);
+}
+
+bool apply_directory_modes(
+    const std::vector<std::pair<fs::path, uint32_t>> &directories,
+    std::string &error)
+{
+	for (auto it = directories.rbegin(); it != directories.rend(); ++it) {
+		if (!chmod_path(it->first, it->second, error)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool create_directory_at_path(const fs::path &path, std::string &error)
+{
+	std::error_code ec;
+	if (fs::exists(path, ec)) {
+		if (fs::is_directory(path, ec)) {
+			return true;
+		}
+		error = "destination exists and is not a directory: " +
+		        path.string();
+		return false;
+	}
+	if (!path.parent_path().empty() && !fs::exists(path.parent_path(), ec)) {
+		error = "destination parent does not exist: " +
+		        path.parent_path().string();
+		return false;
+	}
+	if (!fs::create_directory(path, ec)) {
+		error = "failed to create directory " + path.string() + ": " +
+		        ec.message();
+		return false;
+	}
+	return true;
+}
+
+bool validate_upload_destination(const fs::path &path, bool recursive,
+                                 std::string &error)
+{
+	std::error_code ec;
+	if (fs::exists(path, ec)) {
+		if (!recursive && fs::is_directory(path, ec)) {
+			error = "destination is a directory";
+			return false;
+		}
+		if (recursive && !fs::is_directory(path, ec)) {
+			error = "destination exists and is not a directory: " +
+			        path.string();
+			return false;
+		}
+		return true;
+	}
+
+	fs::path parent = path.parent_path();
+	if (!parent.empty() && !fs::exists(parent, ec)) {
+		error = "destination parent does not exist: " + parent.string();
+		return false;
+	}
+	return true;
+}
+
+uint32_t file_mode(const fs::path &path, std::string &error)
+{
+	std::error_code ec;
+	fs::perms perms = fs::status(path, ec).permissions();
+	if (ec) {
+		error = "failed to read permissions for " + path.string() +
+		        ": " + ec.message();
+		return 0;
+	}
+	return static_cast<uint32_t>(perms) & 07777;
+}
+
+bool append_transfer_entry(const fs::path &path,
+                           const std::string &relative_path,
+                           std::vector<TransferEntry> &entries,
+                           uint64_t &total_size, std::string &error)
+{
+	std::error_code ec;
+	fs::file_status status = fs::status(path, ec);
+	if (ec) {
+		error = "failed to stat " + path.string() + ": " + ec.message();
+		return false;
+	}
+
+	TransferEntry entry;
+	entry.path = path;
+	entry.relative_path = relative_path;
+	entry.mode = file_mode(path, error);
+	if (!error.empty()) {
+		return false;
+	}
+	if (fs::is_directory(status)) {
+		entry.type = FileEntryType::DIRECTORY;
+		entries.push_back(std::move(entry));
+		return true;
+	}
+	if (!fs::is_regular_file(status)) {
+		error = "unsupported file type: " + path.string();
+		return false;
+	}
+
+	entry.type = FileEntryType::REGULAR_FILE;
+	entry.size = fs::file_size(path, ec);
+	if (ec) {
+		error = "failed to read size for " + path.string() + ": " +
+		        ec.message();
+		return false;
+	}
+	total_size += entry.size;
+	entries.push_back(std::move(entry));
+	return true;
+}
+
+bool collect_transfer_entries(const fs::path &source, bool recursive,
+                              std::vector<TransferEntry> &entries,
+                              uint64_t &total_size, std::string &error)
+{
+	std::error_code ec;
+	if (!fs::exists(source, ec)) {
+		error = "remote path does not exist";
+		return false;
+	}
+	if (fs::is_regular_file(source, ec)) {
+		return append_transfer_entry(source, "", entries, total_size, error);
+	}
+	if (!fs::is_directory(source, ec)) {
+		error = "remote path is not a regular file or directory";
+		return false;
+	}
+	if (!recursive) {
+		error = "remote path is a directory (use -r)";
+		return false;
+	}
+
+	if (!append_transfer_entry(source, "", entries, total_size, error)) {
+		return false;
+	}
+	fs::recursive_directory_iterator it(source, ec);
+	fs::recursive_directory_iterator end;
+	if (ec) {
+		error = "failed to read directory " + source.string() + ": " +
+		        ec.message();
+		return false;
+	}
+	for (; it != end; it.increment(ec)) {
+		if (ec) {
+			error = "failed while reading directory " + source.string() +
+			        ": " + ec.message();
+			return false;
+		}
+		fs::path relative = fs::relative(it->path(), source, ec);
+		if (ec) {
+			error = "failed to build relative path for " +
+			        it->path().string() + ": " + ec.message();
+			return false;
+		}
+		if (!append_transfer_entry(it->path(), relative.generic_string(),
+		                           entries, total_size, error)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool send_file_entry(int socket, SecureSession &secure_session,
+                     std::mutex &send_mutex, uint64_t request_id,
+                     const TransferEntry &entry, uint64_t total_size,
+                     uint64_t &bytes_sent, bool last_entry)
+{
+	if (entry.type == FileEntryType::DIRECTORY || entry.size == 0) {
+		Packet pkt;
+		pkt.type = MessageType::FILE_DATA;
+		pkt.content = create_file_data_payload(
+		    request_id, total_size, bytes_sent, entry.type, entry.mode,
+		    entry.relative_path, last_entry, "");
+		return send_packet_locked(socket, secure_session, send_mutex, pkt);
+	}
+
+	std::ifstream file(entry.path, std::ios::binary);
+	if (!file.is_open()) {
+		return false;
+	}
+	size_t chunk_size = calculate_file_chunk_size(total_size);
+	std::string buffer(chunk_size, '\0');
+	while (g_server_running &&
+	       (file.read(buffer.data(), chunk_size) || file.gcount() > 0)) {
+		size_t bytes_read = static_cast<size_t>(file.gcount());
+		bytes_sent += bytes_read;
+		bool eof = last_entry && bytes_sent >= total_size;
+
+		Packet pkt;
+		pkt.type = MessageType::FILE_DATA;
+		pkt.content = create_file_data_payload(
+		    request_id, total_size, bytes_sent, entry.type, entry.mode,
+		    entry.relative_path, eof,
+		    std::string(buffer.data(), bytes_read));
+		if (!send_packet_locked(socket, secure_session, send_mutex, pkt)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void handle_file_put_request(std::map<uint64_t, UploadState> &uploads,
                              int socket, SecureSession &secure_session,
                              std::mutex &send_mutex,
                              const std::string &content)
@@ -378,25 +746,23 @@ void handle_file_put_request(std::map<uint64_t, std::ofstream> &uploads,
 
 	fs::path path = expand_remote_path(request.path);
 
-	std::error_code ec;
-	if (fs::exists(path, ec) && fs::is_directory(path, ec)) {
+	std::string error;
+	if (!validate_upload_destination(path, request.recursive, error)) {
 		send_file_result(socket, secure_session, send_mutex,
 		                 request.request_id, false, 1,
-		                 "destination is a directory");
+		                 error);
 		return;
 	}
 
-	auto &stream = uploads[request.request_id];
-	stream.open(path, std::ios::binary | std::ios::trunc);
-	if (!stream.is_open()) {
-		uploads.erase(request.request_id);
-		send_file_result(socket, secure_session, send_mutex,
-		                 request.request_id, false, 1,
-		                 "failed to open destination file");
-	}
+	UploadState state;
+	state.base_path = path;
+	state.recursive = request.recursive;
+	uploads[request.request_id] = std::move(state);
+	send_file_result(socket, secure_session, send_mutex,
+	                 request.request_id, true, 0, "ready");
 }
 
-void handle_file_data(std::map<uint64_t, std::ofstream> &uploads,
+void handle_file_data(std::map<uint64_t, UploadState> &uploads,
                       int socket, SecureSession &secure_session,
                       std::mutex &send_mutex, const std::string &content)
 {
@@ -414,10 +780,81 @@ void handle_file_data(std::map<uint64_t, std::ofstream> &uploads,
 		return;
 	}
 
+	if (!is_safe_relative_path(data.relative_path)) {
+		send_file_result(socket, secure_session, send_mutex,
+		                 data.request_id, false, 1,
+		                 "unsafe relative path in upload");
+		uploads.erase(it);
+		return;
+	}
+
+	UploadState &state = it->second;
+	fs::path target = state.recursive || !data.relative_path.empty()
+	                      ? target_for_entry(state.base_path,
+	                                         data.relative_path)
+	                      : state.base_path;
+	std::string error;
+
+	if (data.entry_type == FileEntryType::DIRECTORY) {
+		if (!close_open_upload_file(state, error)) {
+			uploads.erase(it);
+			send_file_result(socket, secure_session, send_mutex,
+			                 data.request_id, false, 1, error);
+			return;
+		}
+		if (!create_directory_at_path(target, error)) {
+			uploads.erase(it);
+			send_file_result(socket, secure_session, send_mutex,
+			                 data.request_id, false, 1, error);
+			return;
+		}
+		state.directories.emplace_back(target, data.mode);
+		if (data.eof) {
+			if (!apply_directory_modes(state.directories, error)) {
+				send_file_result(socket, secure_session, send_mutex,
+				                 data.request_id, false, 1, error);
+			} else {
+				send_file_result(socket, secure_session, send_mutex,
+				                 data.request_id, true, 0, "completed");
+			}
+			uploads.erase(it);
+		}
+		return;
+	}
+
+	if (!state.stream.is_open() || state.open_path != target) {
+		if (!close_open_upload_file(state, error)) {
+			uploads.erase(it);
+			send_file_result(socket, secure_session, send_mutex,
+			                 data.request_id, false, 1, error);
+			return;
+		}
+		if (!target.parent_path().empty()) {
+			if (!fs::exists(target.parent_path())) {
+				uploads.erase(it);
+				send_file_result(socket, secure_session, send_mutex,
+				                 data.request_id, false, 1,
+				                 "destination parent does not exist: " +
+				                     target.parent_path().string());
+				return;
+			}
+		}
+		state.stream.open(target, std::ios::binary | std::ios::trunc);
+		if (!state.stream.is_open()) {
+			uploads.erase(it);
+			send_file_result(socket, secure_session, send_mutex,
+			                 data.request_id, false, 1,
+			                 "failed to open destination file");
+			return;
+		}
+		state.open_path = target;
+		state.open_mode = data.mode;
+	}
+
 	if (!data.data.empty()) {
-		it->second.write(data.data.data(), data.data.size());
-		if (!it->second.good()) {
-			it->second.close();
+		state.stream.write(data.data.data(), data.data.size());
+		if (!state.stream.good()) {
+			state.stream.close();
 			uploads.erase(it);
 			send_file_result(socket, secure_session, send_mutex,
 			                 data.request_id, false, 1,
@@ -427,7 +864,13 @@ void handle_file_data(std::map<uint64_t, std::ofstream> &uploads,
 	}
 
 	if (data.eof) {
-		it->second.close();
+		if (!close_open_upload_file(state, error) ||
+		    !apply_directory_modes(state.directories, error)) {
+			uploads.erase(it);
+			send_file_result(socket, secure_session, send_mutex,
+			                 data.request_id, false, 1, error);
+			return;
+		}
 		uploads.erase(it);
 		send_file_result(socket, secure_session, send_mutex,
 		                 data.request_id, true, 0, "completed");
@@ -445,49 +888,30 @@ void handle_file_get_request(int socket, SecureSession &secure_session,
 	}
 
 	fs::path path = expand_remote_path(request.path);
-	if (!fs::exists(path) || !fs::is_regular_file(path)) {
+	std::vector<TransferEntry> entries;
+	uint64_t total_size = 0;
+	std::string error;
+	if (!collect_transfer_entries(path, request.recursive, entries,
+	                              total_size, error)) {
 		send_file_result(socket, secure_session, send_mutex,
 		                 request.request_id, false, 1,
-		                 "remote file does not exist");
+		                 error);
 		return;
 	}
 
-	uint64_t total_size = fs::file_size(path);
-	std::ifstream file(path, std::ios::binary);
-	if (!file.is_open()) {
-		send_file_result(socket, secure_session, send_mutex,
-		                 request.request_id, false, 1,
-		                 "failed to open remote file");
-		return;
-	}
-
-	size_t chunk_size = calculate_file_chunk_size(total_size);
-	std::string buffer(chunk_size, '\0');
 	uint64_t bytes_sent = 0;
-
-	while (g_server_running &&
-	       (file.read(buffer.data(), chunk_size) || file.gcount() > 0)) {
-		size_t bytes_read = static_cast<size_t>(file.gcount());
-		bytes_sent += bytes_read;
-
-		Packet pkt;
-		pkt.type = MessageType::FILE_DATA;
-		pkt.content = create_file_data_payload(
-		    request.request_id, total_size, bytes_sent, false,
-		    std::string(buffer.data(), bytes_read));
-		if (!send_packet_locked(socket, secure_session, send_mutex, pkt)) {
+	for (size_t i = 0; i < entries.size(); ++i) {
+		if (!send_file_entry(socket, secure_session, send_mutex,
+		                     request.request_id, entries[i], total_size,
+		                     bytes_sent, i + 1 == entries.size())) {
+			send_file_result(socket, secure_session, send_mutex,
+			                 request.request_id, false, 1,
+			                 "failed to read remote file");
 			return;
 		}
 	}
-
-	Packet eof_pkt;
-	eof_pkt.type = MessageType::FILE_DATA;
-	eof_pkt.content = create_file_data_payload(
-	    request.request_id, total_size, total_size, true, "");
-	if (send_packet_locked(socket, secure_session, send_mutex, eof_pkt)) {
-		send_file_result(socket, secure_session, send_mutex,
-		                 request.request_id, true, 0, "completed");
-	}
+	send_file_result(socket, secure_session, send_mutex,
+	                 request.request_id, true, 0, "completed");
 }
 
 void handle_connection(int socket, SecureSession secure_session,
@@ -495,10 +919,11 @@ void handle_connection(int socket, SecureSession secure_session,
                        const std::string &authorized_keys_path)
 {
 	std::mutex send_mutex;
-	std::map<uint64_t, std::ofstream> uploads;
+	std::map<uint64_t, UploadState> uploads;
+	AuthenticatedUser user;
 
 	if (!authenticate_connection(socket, secure_session, send_mutex,
-	                             authorized_keys_path)) {
+	                             authorized_keys_path, user)) {
 		return;
 	}
 
@@ -574,6 +999,7 @@ int main(int argc, char *argv[])
 
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
+	signal(SIGCHLD, SIG_IGN);
 
 	int server_socket = socket(AF_INET, SOCK_STREAM, 0);
 	if (server_socket < 0) {
@@ -634,25 +1060,34 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
-		SecureSession secure_session;
-		std::string handshake_error;
-		if (!perform_server_handshake(client_socket, secure_session,
-		                              host_identity, handshake_error)) {
-			LOG(ERROR) << "[Error] Secure handshake failed: "
-			           << handshake_error;
+		uint64_t connection_id = next_connection_id.fetch_add(1);
+		pid_t pid = fork();
+		if (pid < 0) {
+			LOG(ERROR) << "[Error] fork() failed: " << strerror(errno);
 			close(client_socket);
 			continue;
 		}
-
-		uint64_t connection_id = next_connection_id.fetch_add(1);
-		std::string authorized_keys_path = options.authorized_keys_path;
-		std::thread([client_socket, secure_session, connection_id,
-		             authorized_keys_path]() mutable {
-			handle_connection(client_socket, secure_session, connection_id,
-			                  authorized_keys_path);
+		if (pid == 0) {
+			signal(SIGCHLD, SIG_DFL);
+			close(server_socket);
+			SecureSession secure_session;
+			std::string handshake_error;
+			if (!perform_server_handshake(client_socket, secure_session,
+			                              host_identity,
+			                              handshake_error)) {
+				LOG(ERROR) << "[Error] Secure handshake failed: "
+				           << handshake_error;
+				shutdown(client_socket, SHUT_RDWR);
+				close(client_socket);
+				_exit(1);
+			}
+			handle_connection(client_socket, secure_session,
+			                  connection_id, options.authorized_keys_path);
 			shutdown(client_socket, SHUT_RDWR);
 			close(client_socket);
-		}).detach();
+			_exit(0);
+		}
+		close(client_socket);
 	}
 
 	close(server_socket);

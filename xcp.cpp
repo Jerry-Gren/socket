@@ -12,8 +12,10 @@
 #include <netdb.h>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 #include "include/file_transfer.h"
 #include "include/glog_wrapper.h"
@@ -41,6 +43,7 @@ struct RemotePath {
 
 struct Options {
 	bool show_help = false;
+	bool recursive = false;
 	int port = DEFAULT_SERVER_PORT;
 	std::string identity_file;
 	std::string known_hosts_file;
@@ -64,6 +67,7 @@ void print_usage(const char *program)
 	    << "  " << program << " user@host:/tmp/remote.bin ./remote.bin\n"
 	    << "\n"
 	    << "Options:\n"
+	    << "  -r, -R            Copy directories recursively\n"
 	    << "  -P PORT           xshd port (default 4468)\n"
 	    << "  -i FILE           Ed25519 identity file\n"
 	    << "  -o OPTION         UserKnownHostsFile=FILE is supported\n"
@@ -159,6 +163,10 @@ bool parse_arguments(int argc, char *argv[], Options &options)
 		if (arg == "-h" || arg == "--help") {
 			options.show_help = true;
 			return true;
+		}
+		if (arg == "-r" || arg == "-R") {
+			options.recursive = true;
+			continue;
 		}
 		if (arg == "-P" || arg == "-i" || arg == "-o") {
 			if (++i >= argc) {
@@ -347,66 +355,253 @@ void print_progress(uint64_t done, uint64_t total,
 	}
 }
 
-bool send_file_upload(int socket_fd, SecureSession &secure_session,
-                      const fs::path &source, const std::string &remote_path)
+struct TransferEntry {
+	fs::path path;
+	std::string relative_path;
+	FileEntryType type = FileEntryType::REGULAR_FILE;
+	uint32_t mode = 0644;
+	uint64_t size = 0;
+};
+
+uint32_t file_mode(const fs::path &path, std::string &error)
 {
-	if (!fs::exists(source) || !fs::is_regular_file(source)) {
-		std::cerr << "xcp: source is not a regular file\n";
+	std::error_code ec;
+	fs::perms perms = fs::status(path, ec).permissions();
+	if (ec) {
+		error = "failed to read permissions for " + path.string() +
+		        ": " + ec.message();
+		return 0;
+	}
+	return static_cast<uint32_t>(perms) & 07777;
+}
+
+std::string path_basename(const std::string &value)
+{
+	std::string trimmed = value;
+	while (trimmed.size() > 1 &&
+	       (trimmed.back() == '/' || trimmed.back() == '\\')) {
+		trimmed.pop_back();
+	}
+	fs::path path(trimmed);
+	std::string name = path.filename().string();
+	return name.empty() ? "file" : name;
+}
+
+bool append_transfer_entry(const fs::path &path,
+                           const std::string &relative_path,
+                           std::vector<TransferEntry> &entries,
+                           uint64_t &total_size, std::string &error)
+{
+	std::error_code ec;
+	fs::file_status status = fs::status(path, ec);
+	if (ec) {
+		error = "failed to stat " + path.string() + ": " + ec.message();
 		return false;
 	}
 
-	uint64_t request_id = 1;
-	uint64_t total_size = fs::file_size(source);
-	std::string destination_path = remote_path;
-	if (!destination_path.empty() &&
-	    (destination_path.back() == '/' || destination_path.back() == '\\')) {
-		destination_path += source.filename().string();
+	TransferEntry entry;
+	entry.path = path;
+	entry.relative_path = relative_path;
+	entry.mode = file_mode(path, error);
+	if (!error.empty()) {
+		return false;
 	}
 
-	std::ifstream file(source, std::ios::binary);
+	if (fs::is_directory(status)) {
+		entry.type = FileEntryType::DIRECTORY;
+		entry.size = 0;
+		entries.push_back(std::move(entry));
+		return true;
+	}
+	if (!fs::is_regular_file(status)) {
+		error = "unsupported file type: " + path.string();
+		return false;
+	}
+
+	entry.type = FileEntryType::REGULAR_FILE;
+	entry.size = fs::file_size(path, ec);
+	if (ec) {
+		error = "failed to read size for " + path.string() + ": " +
+		        ec.message();
+		return false;
+	}
+	total_size += entry.size;
+	entries.push_back(std::move(entry));
+	return true;
+}
+
+bool collect_transfer_entries(const fs::path &source, bool recursive,
+                              std::vector<TransferEntry> &entries,
+                              uint64_t &total_size, std::string &error)
+{
+	std::error_code ec;
+	if (!fs::exists(source, ec)) {
+		error = "source does not exist";
+		return false;
+	}
+	if (fs::is_regular_file(source, ec)) {
+		return append_transfer_entry(source, "", entries, total_size, error);
+	}
+	if (!fs::is_directory(source, ec)) {
+		error = "source is not a regular file or directory";
+		return false;
+	}
+	if (!recursive) {
+		error = source.string() + " is a directory (use -r)";
+		return false;
+	}
+
+	if (!append_transfer_entry(source, "", entries, total_size, error)) {
+		return false;
+	}
+	fs::recursive_directory_iterator it(source, ec);
+	fs::recursive_directory_iterator end;
+	if (ec) {
+		error = "failed to read directory " + source.string() + ": " +
+		        ec.message();
+		return false;
+	}
+	for (; it != end; it.increment(ec)) {
+		if (ec) {
+			error = "failed while reading directory " + source.string() +
+			        ": " + ec.message();
+			return false;
+		}
+		fs::path relative = fs::relative(it->path(), source, ec);
+		if (ec) {
+			error = "failed to build relative path for " +
+			        it->path().string() + ": " + ec.message();
+			return false;
+		}
+		if (!append_transfer_entry(it->path(), relative.generic_string(),
+		                           entries, total_size, error)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool chmod_path(const fs::path &path, uint32_t mode)
+{
+	std::error_code ec;
+	fs::permissions(path, static_cast<fs::perms>(mode & 07777),
+	                fs::perm_options::replace, ec);
+	if (ec) {
+		std::cerr << "xcp: failed to set permissions on " << path
+		          << ": " << ec.message() << "\n";
+		return false;
+	}
+	return true;
+}
+
+fs::path target_for_entry(const fs::path &root, const std::string &relative)
+{
+	if (relative.empty()) {
+		return root;
+	}
+	return root / fs::path(relative);
+}
+
+bool is_safe_relative_path(const std::string &relative_path)
+{
+	if (relative_path.empty()) {
+		return true;
+	}
+	fs::path path(relative_path);
+	if (path.is_absolute()) {
+		return false;
+	}
+	for (const auto &part : path) {
+		if (part == "..") {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool apply_directory_modes(
+    const std::vector<std::pair<fs::path, uint32_t>> &directories)
+{
+	for (auto it = directories.rbegin(); it != directories.rend(); ++it) {
+		if (!chmod_path(it->first, it->second)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool create_directory_at_path(const fs::path &path)
+{
+	std::error_code ec;
+	if (fs::exists(path, ec)) {
+		if (fs::is_directory(path, ec)) {
+			return true;
+		}
+		std::cerr << "xcp: destination exists and is not a directory: "
+		          << path << "\n";
+		return false;
+	}
+	if (!path.parent_path().empty() && !fs::exists(path.parent_path(), ec)) {
+		std::cerr << "xcp: destination parent does not exist: "
+		          << path.parent_path() << "\n";
+		return false;
+	}
+	if (!fs::create_directory(path, ec)) {
+		std::cerr << "xcp: failed to create directory " << path
+		          << ": " << ec.message() << "\n";
+		return false;
+	}
+	return true;
+}
+
+bool send_file_entry(int socket_fd, SecureSession &secure_session,
+                     uint64_t request_id, const TransferEntry &entry,
+                     uint64_t total_size, uint64_t &bytes_sent,
+                     bool last_entry,
+                     std::chrono::steady_clock::time_point started_at,
+                     int &last_percent)
+{
+	if (entry.type == FileEntryType::DIRECTORY || entry.size == 0) {
+		Packet pkt;
+		pkt.type = MessageType::FILE_DATA;
+		pkt.content = create_file_data_payload(
+		    request_id, total_size, bytes_sent, entry.type, entry.mode,
+		    entry.relative_path, last_entry, "");
+		return send_secure_packet(socket_fd, secure_session, pkt);
+	}
+
+	std::ifstream file(entry.path, std::ios::binary);
 	if (!file.is_open()) {
-		std::cerr << "xcp: failed to open source file\n";
-		return false;
-	}
-
-	Packet request_pkt;
-	request_pkt.type = MessageType::FILE_PUT_REQUEST;
-	request_pkt.content = create_file_request_payload(
-	    request_id, total_size, destination_path);
-	if (!send_secure_packet(socket_fd, secure_session, request_pkt)) {
+		std::cerr << "xcp: failed to open source file: "
+		          << entry.path << "\n";
 		return false;
 	}
 
 	size_t chunk_size = calculate_file_chunk_size(total_size);
 	std::string buffer(chunk_size, '\0');
-	uint64_t bytes_sent = 0;
-	auto started_at = std::chrono::steady_clock::now();
-	int last_percent = -1;
-
 	while (g_running &&
 	       (file.read(buffer.data(), chunk_size) || file.gcount() > 0)) {
 		size_t bytes_read = static_cast<size_t>(file.gcount());
 		bytes_sent += bytes_read;
+		bool eof = last_entry && bytes_sent >= total_size;
 
-		Packet data_pkt;
-		data_pkt.type = MessageType::FILE_DATA;
-		data_pkt.content = create_file_data_payload(
-		    request_id, total_size, bytes_sent, false,
+		Packet pkt;
+		pkt.type = MessageType::FILE_DATA;
+		pkt.content = create_file_data_payload(
+		    request_id, total_size, bytes_sent, entry.type, entry.mode,
+		    entry.relative_path, eof,
 		    std::string(buffer.data(), bytes_read));
-		if (!send_secure_packet(socket_fd, secure_session, data_pkt)) {
+		if (!send_secure_packet(socket_fd, secure_session, pkt)) {
 			return false;
 		}
 		print_progress(bytes_sent, total_size, started_at, last_percent);
 	}
+	return true;
+}
 
-	Packet eof_pkt;
-	eof_pkt.type = MessageType::FILE_DATA;
-	eof_pkt.content = create_file_data_payload(
-	    request_id, total_size, total_size, true, "");
-	if (!send_secure_packet(socket_fd, secure_session, eof_pkt)) {
-		return false;
-	}
-
+bool read_file_result(int socket_fd, SecureSession &secure_session,
+                      uint64_t request_id)
+{
 	while (g_running) {
 		Packet response;
 		if (!read_secure_packet(socket_fd, secure_session, response)) {
@@ -428,33 +623,83 @@ bool send_file_upload(int socket_fd, SecureSession &secure_session,
 	return false;
 }
 
+bool send_file_upload(int socket_fd, SecureSession &secure_session,
+                      const fs::path &source, const std::string &remote_path,
+                      bool recursive)
+{
+	std::vector<TransferEntry> entries;
+	uint64_t total_size = 0;
+	std::string error;
+	if (!collect_transfer_entries(source, recursive, entries, total_size,
+	                              error)) {
+		std::cerr << "xcp: " << error << "\n";
+		return false;
+	}
+
+	uint64_t request_id = 1;
+	std::string destination_path = remote_path;
+	if (!destination_path.empty() &&
+	    (destination_path.back() == '/' || destination_path.back() == '\\')) {
+		destination_path += source.filename().string();
+	}
+	bool source_is_directory = fs::is_directory(source);
+
+	Packet request_pkt;
+	request_pkt.type = MessageType::FILE_PUT_REQUEST;
+	request_pkt.content = create_file_request_payload(
+	    request_id, total_size, source_is_directory, destination_path);
+	if (!send_secure_packet(socket_fd, secure_session, request_pkt)) {
+		return false;
+	}
+	if (!read_file_result(socket_fd, secure_session, request_id)) {
+		return false;
+	}
+
+	uint64_t bytes_sent = 0;
+	auto started_at = std::chrono::steady_clock::now();
+	int last_percent = -1;
+	print_progress(0, total_size, started_at, last_percent);
+	for (size_t i = 0; i < entries.size(); ++i) {
+		if (!send_file_entry(socket_fd, secure_session, request_id,
+		                     entries[i], total_size, bytes_sent,
+		                     i + 1 == entries.size(), started_at,
+		                     last_percent)) {
+			return false;
+		}
+	}
+
+	if (entries.empty() || !entries.back().size) {
+		print_progress(total_size, total_size, started_at, last_percent);
+	}
+
+	return read_file_result(socket_fd, secure_session, request_id);
+}
+
 bool receive_file_download(int socket_fd, SecureSession &secure_session,
                            const std::string &remote_path,
-                           const fs::path &destination)
+                           const fs::path &destination, bool recursive)
 {
 	uint64_t request_id = 1;
 	Packet request_pkt;
 	request_pkt.type = MessageType::FILE_GET_REQUEST;
-	request_pkt.content =
-	    create_file_request_payload(request_id, 0, remote_path);
+	request_pkt.content = create_file_request_payload(
+	    request_id, 0, recursive, remote_path);
 	if (!send_secure_packet(socket_fd, secure_session, request_pkt)) {
 		return false;
 	}
 
-	fs::path output_path = destination;
 	std::error_code ec;
-	if (fs::exists(output_path, ec) && fs::is_directory(output_path, ec)) {
-		output_path /= fs::path(remote_path).filename();
-	}
-	if (output_path.empty() || output_path.filename().empty()) {
-		std::cerr << "xcp: invalid destination file\n";
-		return false;
-	}
-	std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
-	if (!output.is_open()) {
-		std::cerr << "xcp: failed to open destination file\n";
-		return false;
-	}
+	bool destination_is_directory =
+	    fs::exists(destination, ec) && fs::is_directory(destination, ec);
+	fs::path root_path;
+	fs::path single_file_path = destination_is_directory
+	                                ? destination / path_basename(remote_path)
+	                                : destination;
+	bool root_path_initialized = false;
+	std::ofstream output;
+	fs::path open_path;
+	uint32_t open_mode = 0644;
+	std::vector<std::pair<fs::path, uint32_t>> directories;
 
 	uint64_t total_size = 0;
 	uint64_t bytes_received = 0;
@@ -467,6 +712,15 @@ bool receive_file_download(int socket_fd, SecureSession &secure_session,
 			return false;
 		}
 		if (pkt.type == MessageType::FILE_RESULT) {
+			if (output.is_open()) {
+				output.close();
+				if (!chmod_path(open_path, open_mode)) {
+					return false;
+				}
+			}
+			if (!apply_directory_modes(directories)) {
+				return false;
+			}
 			FileResultPayload result;
 			if (!parse_file_result_payload(pkt.content, result) ||
 			    result.request_id != request_id) {
@@ -486,7 +740,66 @@ bool receive_file_download(int socket_fd, SecureSession &secure_session,
 		    data.request_id != request_id) {
 			continue;
 		}
+		if (!is_safe_relative_path(data.relative_path)) {
+			std::cerr << "xcp: unsafe relative path in transfer\n";
+			return false;
+		}
+		if (!root_path_initialized) {
+			if (data.entry_type == FileEntryType::DIRECTORY ||
+			    !data.relative_path.empty()) {
+				root_path = destination_is_directory
+				                ? destination / path_basename(remote_path)
+				                : destination;
+			} else {
+				root_path = single_file_path;
+			}
+			root_path_initialized = true;
+		}
+		fs::path target =
+		    data.entry_type == FileEntryType::DIRECTORY ||
+		            !data.relative_path.empty()
+		        ? target_for_entry(root_path, data.relative_path)
+		        : single_file_path;
 		total_size = data.total_size;
+		if (data.entry_type == FileEntryType::DIRECTORY) {
+			if (output.is_open()) {
+				output.close();
+				if (!chmod_path(open_path, open_mode)) {
+					return false;
+				}
+			}
+			if (!create_directory_at_path(target)) {
+				return false;
+			}
+			directories.emplace_back(target, data.mode);
+			bytes_received = data.bytes_sent;
+			print_progress(bytes_received, total_size, started_at,
+			               last_percent);
+			continue;
+		}
+		if (!output.is_open() || open_path != target) {
+			if (output.is_open()) {
+				output.close();
+				if (!chmod_path(open_path, open_mode)) {
+					return false;
+				}
+			}
+			if (!target.parent_path().empty()) {
+				if (!fs::exists(target.parent_path())) {
+					std::cerr << "xcp: destination parent does not exist: "
+					          << target.parent_path() << "\n";
+					return false;
+				}
+			}
+			output.open(target, std::ios::binary | std::ios::trunc);
+			if (!output.is_open()) {
+				std::cerr << "xcp: failed to open destination file "
+				          << target << "\n";
+				return false;
+			}
+			open_path = target;
+			open_mode = data.mode;
+		}
 		if (!data.data.empty()) {
 			output.write(data.data.data(), data.data.size());
 			if (!output.good()) {
@@ -549,11 +862,13 @@ int main(int argc, char *argv[])
 	if (!options.source.remote) {
 		success = send_file_upload(socket_fd, secure_session,
 		                           options.source.path,
-		                           options.destination.path);
+		                           options.destination.path,
+		                           options.recursive);
 	} else {
 		success = receive_file_download(socket_fd, secure_session,
 		                                options.source.path,
-		                                options.destination.path);
+		                                options.destination.path,
+		                                options.recursive);
 	}
 
 	Packet disconnect;

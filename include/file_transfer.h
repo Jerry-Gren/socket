@@ -11,13 +11,22 @@ constexpr size_t MAX_FILE_CHUNK_SIZE = 1024 * 1024;
 struct FileRequestPayload {
 	uint64_t request_id = 0;
 	uint64_t total_size = 0;
+	bool recursive = false;
 	std::string path;
+};
+
+enum class FileEntryType : uint8_t {
+	REGULAR_FILE = 1,
+	DIRECTORY = 2,
 };
 
 struct FileDataPayload {
 	uint64_t request_id = 0;
 	uint64_t total_size = 0;
 	uint64_t bytes_sent = 0;
+	FileEntryType entry_type = FileEntryType::REGULAR_FILE;
+	uint32_t mode = 0644;
+	std::string relative_path;
 	bool eof = false;
 	std::string data;
 };
@@ -138,13 +147,15 @@ inline bool read_string(const std::string &input, size_t &offset,
 }
 
 inline std::string create_file_request_payload(
-    uint64_t request_id, uint64_t total_size, const std::string &path)
+    uint64_t request_id, uint64_t total_size, bool recursive,
+    const std::string &path)
 {
 	std::string payload;
-	payload.reserve(21 + path.size());
-	append_uint8(payload, 1);
+	payload.reserve(22 + path.size());
+	append_uint8(payload, 2);
 	append_uint64(payload, request_id);
 	append_uint64(payload, total_size);
+	append_uint8(payload, recursive ? 1 : 0);
 	append_string(payload, path);
 	return payload;
 }
@@ -154,23 +165,34 @@ inline bool parse_file_request_payload(const std::string &input,
 {
 	size_t offset = 0;
 	uint8_t version = 0;
-	return read_uint8(input, offset, version) && version == 1 &&
-	       read_uint64(input, offset, payload.request_id) &&
-	       read_uint64(input, offset, payload.total_size) &&
-	       read_string(input, offset, payload.path) &&
-	       offset == input.size();
+	uint8_t recursive = 0;
+	if (!read_uint8(input, offset, version) || version != 2 ||
+	    !read_uint64(input, offset, payload.request_id) ||
+	    !read_uint64(input, offset, payload.total_size) ||
+	    !read_uint8(input, offset, recursive) ||
+	    !read_string(input, offset, payload.path) ||
+	    offset != input.size() ||
+	    (recursive != 0 && recursive != 1)) {
+		return false;
+	}
+	payload.recursive = recursive == 1;
+	return true;
 }
 
 inline std::string create_file_data_payload(
-    uint64_t request_id, uint64_t total_size, uint64_t bytes_sent, bool eof,
-    const std::string &data)
+    uint64_t request_id, uint64_t total_size, uint64_t bytes_sent,
+    FileEntryType entry_type, uint32_t mode, const std::string &relative_path,
+    bool eof, const std::string &data)
 {
 	std::string payload;
-	payload.reserve(27 + data.size());
-	append_uint8(payload, 1);
+	payload.reserve(36 + relative_path.size() + data.size());
+	append_uint8(payload, 2);
 	append_uint64(payload, request_id);
 	append_uint64(payload, total_size);
 	append_uint64(payload, bytes_sent);
+	append_uint8(payload, static_cast<uint8_t>(entry_type));
+	append_uint32(payload, mode);
+	append_string(payload, relative_path);
 	append_uint8(payload, eof ? 1 : 0);
 	append_string(payload, data);
 	return payload;
@@ -182,14 +204,25 @@ inline bool parse_file_data_payload(const std::string &input,
 	size_t offset = 0;
 	uint8_t version = 0;
 	uint8_t eof = 0;
-	if (!read_uint8(input, offset, version) || version != 1 ||
+	uint8_t entry_type = 0;
+	if (!read_uint8(input, offset, version) || version != 2 ||
 	    !read_uint64(input, offset, payload.request_id) ||
 	    !read_uint64(input, offset, payload.total_size) ||
 	    !read_uint64(input, offset, payload.bytes_sent) ||
+	    !read_uint8(input, offset, entry_type) ||
+	    !read_uint32(input, offset, payload.mode) ||
+	    !read_string(input, offset, payload.relative_path) ||
 	    !read_uint8(input, offset, eof) ||
 	    !read_string(input, offset, payload.data) ||
 	    offset != input.size() ||
 	    (eof != 0 && eof != 1)) {
+		return false;
+	}
+	if (entry_type == static_cast<uint8_t>(FileEntryType::REGULAR_FILE)) {
+		payload.entry_type = FileEntryType::REGULAR_FILE;
+	} else if (entry_type == static_cast<uint8_t>(FileEntryType::DIRECTORY)) {
+		payload.entry_type = FileEntryType::DIRECTORY;
+	} else {
 		return false;
 	}
 	payload.eof = eof == 1;
