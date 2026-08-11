@@ -25,6 +25,8 @@
 #include "include/glog_wrapper.h"
 #include "include/file_transfer.h"
 #include "include/protocol.h"
+#include "include/secure_channel.h"
+#include "include/shell_exec.h"
 #include "include/client_info.h"
 #include "include/client_manager.h"
 #include "include/utility.h"
@@ -225,8 +227,105 @@ void handle_send_file_request(int client_id, const std::string &content)
 	g_client_manager.send_to_client(target_id, forward_pkt);
 }
 
+void handle_shell_exec_request(int client_id, const std::string &content)
+{
+	ShellExecRequestPayload request;
+	if (!parse_shell_exec_request_payload(content, request)) {
+		LOG(ERROR) << "Failed to parse shell request from " << client_id;
+		return;
+	}
+
+	uint64_t target_id = request.peer_id;
+	if (!g_client_manager.get_client(target_id).has_value()) {
+		Packet result_pkt;
+		result_pkt.type = MessageType::SHELL_EXEC_RESULT;
+		result_pkt.content = create_shell_exec_result_payload(
+		    target_id, request.request_id, 255, false,
+		    "target client not found");
+		g_client_manager.send_to_client(client_id, result_pkt);
+		return;
+	}
+
+	Packet forward_pkt;
+	forward_pkt.type = MessageType::SHELL_EXEC_REQUEST;
+	forward_pkt.content = create_shell_exec_request_payload(
+	    client_id, request.request_id, request.timeout_seconds,
+	    request.command);
+	g_client_manager.send_to_client(target_id, forward_pkt);
+}
+
+void handle_shell_exec_stdin(int client_id, const std::string &content)
+{
+	ShellExecStdinPayload input;
+	if (!parse_shell_exec_stdin_payload(content, input)) {
+		LOG(ERROR) << "Failed to parse shell stdin from " << client_id;
+		return;
+	}
+
+	uint64_t target_id = input.peer_id;
+	if (!g_client_manager.get_client(target_id).has_value()) {
+		return;
+	}
+
+	Packet forward_pkt;
+	forward_pkt.type = MessageType::SHELL_EXEC_STDIN;
+	forward_pkt.content = create_shell_exec_stdin_payload(
+	    client_id, input.request_id, input.eof, input.data);
+	g_client_manager.send_to_client(target_id, forward_pkt);
+}
+
+void handle_shell_exec_output(int client_id, const std::string &content)
+{
+	ShellExecOutputPayload output;
+	if (!parse_shell_exec_output_payload(content, output)) {
+		LOG(ERROR) << "Failed to parse shell output from " << client_id;
+		return;
+	}
+
+	uint64_t target_id = output.peer_id;
+	if (!g_client_manager.get_client(target_id).has_value()) {
+		return;
+	}
+
+	Packet forward_pkt;
+	forward_pkt.type = MessageType::SHELL_EXEC_OUTPUT;
+	forward_pkt.content = create_shell_exec_output_payload(
+	    client_id, output.request_id, output.stream, output.data);
+	g_client_manager.send_to_client(target_id, forward_pkt);
+}
+
+void handle_shell_exec_result(int client_id, const std::string &content)
+{
+	ShellExecResultPayload result;
+	if (!parse_shell_exec_result_payload(content, result)) {
+		LOG(ERROR) << "Failed to parse shell result from " << client_id;
+		return;
+	}
+
+	uint64_t target_id = result.peer_id;
+	if (!g_client_manager.get_client(target_id).has_value()) {
+		return;
+	}
+
+	Packet forward_pkt;
+	forward_pkt.type = MessageType::SHELL_EXEC_RESULT;
+	forward_pkt.content = create_shell_exec_result_payload(
+	    client_id, result.request_id, result.exit_code, result.timed_out,
+	    result.message);
+	g_client_manager.send_to_client(target_id, forward_pkt);
+}
+
 void log_received_packet(int client_id, const Packet &pkt)
 {
+	if (pkt.type == MessageType::SHELL_EXEC_REQUEST ||
+	    pkt.type == MessageType::SHELL_EXEC_STDIN ||
+	    pkt.type == MessageType::SHELL_EXEC_OUTPUT ||
+	    pkt.type == MessageType::SHELL_EXEC_RESULT) {
+		LOG(INFO) << "Received from ID " << client_id
+		          << ", Type: " << MessageTypeToString(pkt.type);
+		return;
+	}
+
 	if (pkt.type != MessageType::SEND_FILE_REQUEST) {
 		LOG(INFO) << "Received from ID " << client_id
 		          << ", Type: " << MessageTypeToString(pkt.type)
@@ -299,7 +398,8 @@ void handle_unhandled_request(int client_id, MessageType type, const std::string
 
 // Client handler function
 // This function is executed in a separate thread for each new connection
-void handle_client(int client_id, int client_socket)
+void handle_client(int client_id, int client_socket,
+                   SecureSession secure_session)
 {
 
 	LOG(INFO) << "[Info] Client Handler started for ID: " << client_id
@@ -319,8 +419,8 @@ void handle_client(int client_id, int client_socket)
 	// Main loop to handle incoming packets
 	while (g_server_running && !client_requested_disconnect) {
 		Packet received_pkt;
-		if (!read_packet(client_socket, received_pkt)) {
-			// read_packet returns false on disconnect or critical error
+		if (!read_secure_packet(client_socket, secure_session, received_pkt)) {
+			// read_secure_packet returns false on disconnect or critical error
 			LOG(INFO) << "[Info] Client " << client_id
 			          << " connection closed or errored.";
 			break;
@@ -342,6 +442,18 @@ void handle_client(int client_id, int client_socket)
 			break;
 		case MessageType::SEND_FILE_REQUEST:
 			handle_send_file_request(client_id, received_pkt.content);
+			break;
+		case MessageType::SHELL_EXEC_REQUEST:
+			handle_shell_exec_request(client_id, received_pkt.content);
+			break;
+		case MessageType::SHELL_EXEC_STDIN:
+			handle_shell_exec_stdin(client_id, received_pkt.content);
+			break;
+		case MessageType::SHELL_EXEC_OUTPUT:
+			handle_shell_exec_output(client_id, received_pkt.content);
+			break;
+		case MessageType::SHELL_EXEC_RESULT:
+			handle_shell_exec_result(client_id, received_pkt.content);
 			break;
 		case MessageType::DISCONNECT_REQUEST:
 			LOG(INFO)
@@ -440,13 +552,23 @@ int main(int argc, char *argv[])
 				std::string ip = inet_ntoa(client_address.sin_addr);
 				int port = ntohs(client_address.sin_port);
 
+				SecureSession secure_session;
+				if (!perform_server_handshake(client_socket, secure_session)) {
+					LOG(ERROR) << "[Error] Secure handshake failed for "
+					           << ip << ":" << port;
+					close(client_socket);
+					continue;
+				}
+
 				// 7. Add client to manager and get its ID
 				int client_id =
-				    g_client_manager.add_client(client_socket, ip, port);
+				    g_client_manager.add_client(client_socket, ip, port,
+				                                secure_session);
 
 				// 8. Create and detach a new thread to handle the client
 				// request.
-				std::thread(handle_client, client_id, client_socket)
+				std::thread(handle_client, client_id, client_socket,
+				            secure_session)
 				    .detach();
 			}
 		}

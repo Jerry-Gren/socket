@@ -12,6 +12,8 @@
 enum class MessageType : uint8_t {
 	// General
 	UNDEFINED = 0,
+	KEY_EXCHANGE = 1,
+	ENCRYPTED_PACKET = 2,
 
 	// Client to Server Requests
 	GET_TIME_REQUEST = 10,
@@ -20,6 +22,8 @@ enum class MessageType : uint8_t {
 	SEND_MESSAGE_REQUEST = 13,
 	SEND_FILE_REQUEST = 14,
 	DISCONNECT_REQUEST = 15,
+	SHELL_EXEC_REQUEST = 16,
+	SHELL_EXEC_STDIN = 17,
 
 	// Server to Client Responses (synchronous reply to a request)
 	GET_TIME_RESPONSE = 20,
@@ -33,6 +37,8 @@ enum class MessageType : uint8_t {
 	SERVER_SHUTDOWN_INDICATION = 31, // Server is shutting down
 	SYSTEM_NOTICE_INDICATION = 32,
 	FILE_INDICATION = 33,
+	SHELL_EXEC_OUTPUT = 34,
+	SHELL_EXEC_RESULT = 35,
 };
 
 /**

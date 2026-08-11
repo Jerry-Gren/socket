@@ -17,11 +17,19 @@
 #include <fstream>
 #include <filesystem>
 #include <map>
+#include <atomic>
+#include <cerrno>
+#include <cctype>
+#include <cstdlib>
+#include <deque>
+#include <memory>
 
 #include "include/glog_wrapper.h"
 #include "include/file_transfer.h"
 #include "include/packet.h"
 #include "include/protocol.h"
+#include "include/secure_channel.h"
+#include "include/shell_exec.h"
 #include "include/utility.h"
 
 #define SERVER_ADDRESS "127.0.0.1"
@@ -35,8 +43,51 @@ std::mutex g_msg_queue_mutex;
 std::condition_variable g_cv;
 std::queue<Packet> g_msg_queue;
 std::atomic<bool> g_client_running(true);
+std::atomic<uint64_t> g_next_shell_request_id(1);
+std::mutex g_send_mutex;
 
 const char *g_prompt = "$ ";
+constexpr size_t SHELL_STREAM_CHUNK_SIZE = 32 * 1024;
+
+struct ShellInputKey {
+	uint64_t peer_id = 0;
+	uint64_t request_id = 0;
+
+	bool operator<(const ShellInputKey &other) const
+	{
+		if (peer_id != other.peer_id) return peer_id < other.peer_id;
+		return request_id < other.request_id;
+	}
+};
+
+struct ShellInputQueue {
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::deque<ShellInputChunk> chunks;
+	bool closed = false;
+};
+
+struct RemoteExecOptions {
+	bool enabled = false;
+	bool show_help = false;
+	bool forward_stdin = true;
+	bool quiet = false;
+	bool request_tty = false;
+	uint32_t timeout_seconds = 0;
+	int server_port = SERVER_PORT;
+	std::string server_ip = SERVER_ADDRESS;
+	std::string destination;
+	uint64_t target_id = 0;
+	std::string command;
+};
+
+std::mutex g_shell_input_mutex;
+std::map<ShellInputKey, std::shared_ptr<ShellInputQueue>> g_shell_inputs;
+
+bool send_packet(int socket, SecureSession &secure_session, const Packet &pkt);
+void run_shell_exec_request(int socket, SecureSession *secure_session,
+                            ShellExecRequestPayload request,
+                            std::shared_ptr<ShellInputQueue> input_queue);
 
 void client_signal_handler(int signum)
 {
@@ -46,14 +97,90 @@ void client_signal_handler(int signum)
 	g_cv.notify_all();
 }
 
+std::shared_ptr<ShellInputQueue> register_shell_input_queue(
+    const ShellInputKey &key)
+{
+	auto queue = std::make_shared<ShellInputQueue>();
+	std::lock_guard<std::mutex> lock(g_shell_input_mutex);
+	g_shell_inputs[key] = queue;
+	return queue;
+}
+
+void unregister_shell_input_queue(const ShellInputKey &key)
+{
+	std::shared_ptr<ShellInputQueue> queue;
+	{
+		std::lock_guard<std::mutex> lock(g_shell_input_mutex);
+		auto it = g_shell_inputs.find(key);
+		if (it == g_shell_inputs.end()) {
+			return;
+		}
+		queue = it->second;
+		g_shell_inputs.erase(it);
+	}
+	{
+		std::lock_guard<std::mutex> lock(queue->mutex);
+		queue->closed = true;
+	}
+	queue->cv.notify_all();
+}
+
+bool push_shell_input(const ShellExecStdinPayload &payload)
+{
+	std::shared_ptr<ShellInputQueue> queue;
+	{
+		std::lock_guard<std::mutex> lock(g_shell_input_mutex);
+		auto it = g_shell_inputs.find(
+		    ShellInputKey{payload.peer_id, payload.request_id});
+		if (it == g_shell_inputs.end()) {
+			return false;
+		}
+		queue = it->second;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(queue->mutex);
+		if (queue->closed) {
+			return false;
+		}
+		queue->chunks.push_back(ShellInputChunk{payload.eof, payload.data});
+		if (payload.eof) {
+			queue->closed = true;
+		}
+	}
+	queue->cv.notify_one();
+	return true;
+}
+
+bool pop_shell_input(const std::shared_ptr<ShellInputQueue> &queue,
+                     ShellInputChunk &chunk,
+                     std::chrono::milliseconds max_wait)
+{
+	std::unique_lock<std::mutex> lock(queue->mutex);
+	if (queue->chunks.empty() && !queue->closed && max_wait.count() > 0) {
+		queue->cv.wait_for(lock, max_wait);
+	}
+	if (queue->chunks.empty()) {
+		if (queue->closed) {
+			chunk.eof = true;
+			chunk.data.clear();
+			return true;
+		}
+		return false;
+	}
+	chunk = std::move(queue->chunks.front());
+	queue->chunks.pop_front();
+	return true;
+}
+
 // Producer thread function
 // Receives messages from the server and puts them into the shared queue
-void receive_messages(int client_socket)
+void receive_messages(int client_socket, SecureSession *secure_session)
 {
 	while (g_client_running) {
 		Packet received_pkt;
-		if (!read_packet(client_socket, received_pkt)) {
-			// read_packet returns false on disconnect or critical error
+		if (!read_secure_packet(client_socket, *secure_session, received_pkt)) {
+			// read_secure_packet returns false on disconnect or critical error
 			if (g_client_running) { // Avoid error message on clean shutdown
 				LOG(INFO) << "[Info] Server disconnected.";
 			}
@@ -73,7 +200,7 @@ void receive_messages(int client_socket)
 
 // Consumer thread function
 // Takes packets from the shared queue and displays them to the user
-void present_messages()
+void present_messages(int client_socket, SecureSession *secure_session)
 {
 	while (g_client_running) {
 		Packet packet_to_show;
@@ -224,6 +351,79 @@ void present_messages()
 					output = "[Message]: (Parse Error)";
 				}
 				break;
+			case MessageType::SHELL_EXEC_REQUEST:
+				try {
+					ShellExecRequestPayload request;
+					if (!parse_shell_exec_request_payload(packet_to_show.content,
+					                                      request)) {
+						output = "[Shell Error]: Invalid exec request";
+						break;
+					}
+					auto input_queue = register_shell_input_queue(
+					    ShellInputKey{request.peer_id, request.request_id});
+					std::thread(run_shell_exec_request, client_socket,
+					            secure_session, request, input_queue)
+					    .detach();
+					continue;
+				} catch (const std::exception &e) {
+					output = "[Shell Error]: " + std::string(e.what());
+				}
+				break;
+			case MessageType::SHELL_EXEC_STDIN:
+				try {
+					ShellExecStdinPayload shell_input;
+					if (!parse_shell_exec_stdin_payload(packet_to_show.content,
+					                                    shell_input)) {
+						output = "[Shell Error]: Invalid stdin payload";
+						break;
+					}
+					push_shell_input(shell_input);
+					continue;
+				} catch (const std::exception &e) {
+					output = "[Shell Error]: " + std::string(e.what());
+				}
+				break;
+			case MessageType::SHELL_EXEC_OUTPUT:
+				try {
+					ShellExecOutputPayload shell_output;
+					if (!parse_shell_exec_output_payload(packet_to_show.content,
+					                                     shell_output)) {
+						output = "[Shell Error]: Invalid output payload";
+						break;
+					}
+					std::string stream =
+					    shell_output.stream == ShellOutputStream::STDOUT
+					        ? "stdout"
+					        : "stderr";
+					output = "[Shell from " + std::to_string(shell_output.peer_id) +
+					         " #" + std::to_string(shell_output.request_id) +
+					         " " + stream + "]:\n" +
+					         sanitize_for_terminal(shell_output.data);
+				} catch (const std::exception &e) {
+					output = "[Shell Error]: " + std::string(e.what());
+				}
+				break;
+			case MessageType::SHELL_EXEC_RESULT:
+				try {
+					ShellExecResultPayload result;
+					if (!parse_shell_exec_result_payload(packet_to_show.content,
+					                                     result)) {
+						output = "[Shell Error]: Invalid result payload";
+						break;
+					}
+					output = "[Shell from " + std::to_string(result.peer_id) +
+					         " #" + std::to_string(result.request_id) +
+					         "]: exit=" + std::to_string(result.exit_code);
+					if (result.timed_out) {
+						output += " timeout";
+					}
+					if (!result.message.empty()) {
+						output += " (" + sanitize_for_terminal(result.message) + ")";
+					}
+				} catch (const std::exception &e) {
+					output = "[Shell Error]: " + std::string(e.what());
+				}
+				break;
 			case MessageType::SERVER_SHUTDOWN_INDICATION:
 				try {
 					json data = json::parse(packet_to_show.content);
@@ -278,13 +478,15 @@ void on_command_help()
 	          << "  send       - Send a message to a client\n"
 		  << "  sendfile   - Send a file to a client\n"
 	          << "  disconnect - Disconnect from server and exit\n"
+	          << "\nRemote command mode:\n"
+	          << "  client [options] <client-id> <command> [args...]\n"
 	          << "---------------------\n";
 }
 
-bool send_packet(int socket, const Packet &pkt)
+bool send_packet(int socket, SecureSession &secure_session, const Packet &pkt)
 {
-	std::vector<char> message_stream = create_message_stream(pkt);
-	if (!send_all(socket, message_stream.data(), message_stream.size())) {
+	std::lock_guard<std::mutex> lock(g_send_mutex);
+	if (!send_secure_packet(socket, secure_session, pkt)) {
 		LOG(ERROR) << "[Error] Failed to send packet: "
 		           << MessageTypeToString(pkt.type);
 		g_client_running = false;
@@ -294,31 +496,65 @@ bool send_packet(int socket, const Packet &pkt)
 	return true;
 }
 
-void on_command_get_time(int socket)
+void run_shell_exec_request(int socket, SecureSession *secure_session,
+                            ShellExecRequestPayload request,
+                            std::shared_ptr<ShellInputQueue> input_queue)
+{
+	ShellInputKey input_key{request.peer_id, request.request_id};
+
+	auto on_output = [&](ShellOutputStream stream, const std::string &data) {
+		if (!g_client_running || data.empty()) {
+			return;
+		}
+		Packet output_pkt;
+		output_pkt.type = MessageType::SHELL_EXEC_OUTPUT;
+		output_pkt.content = create_shell_exec_output_payload(
+		    request.peer_id, request.request_id, stream, data);
+		send_packet(socket, *secure_session, output_pkt);
+	};
+
+	auto on_input = [&](ShellInputChunk &chunk,
+	                    std::chrono::milliseconds max_wait) {
+		return pop_shell_input(input_queue, chunk, max_wait);
+	};
+
+	ShellExecResultPayload result =
+	    execute_shell_command(request, on_output, on_input);
+	unregister_shell_input_queue(input_key);
+
+	Packet result_pkt;
+	result_pkt.type = MessageType::SHELL_EXEC_RESULT;
+	result_pkt.content = create_shell_exec_result_payload(
+	    request.peer_id, request.request_id, result.exit_code,
+	    result.timed_out, result.message);
+	send_packet(socket, *secure_session, result_pkt);
+}
+
+void on_command_get_time(int socket, SecureSession &secure_session)
 {
 	LOG(INFO) << "[Cmd] Requesting server time...";
 	Packet pkt;
 	pkt.type = MessageType::GET_TIME_REQUEST;
-	send_packet(socket, pkt);
+	send_packet(socket, secure_session, pkt);
 }
 
-void on_command_get_name(int socket)
+void on_command_get_name(int socket, SecureSession &secure_session)
 {
 	LOG(INFO) << "[Cmd] Requesting server name...";
 	Packet pkt;
 	pkt.type = MessageType::GET_NAME_REQUEST;
-	send_packet(socket, pkt);
+	send_packet(socket, secure_session, pkt);
 }
 
-void on_command_get_list(int socket)
+void on_command_get_list(int socket, SecureSession &secure_session)
 {
 	LOG(INFO) << "[Cmd] Requesting client list...";
 	Packet pkt;
 	pkt.type = MessageType::GET_CLIENT_LIST_REQUEST;
-	send_packet(socket, pkt);
+	send_packet(socket, secure_session, pkt);
 }
 
-void on_command_send_message(int socket)
+void on_command_send_message(int socket, SecureSession &secure_session)
 {
 	uint64_t target_id;
 	std::string message;
@@ -364,10 +600,10 @@ void on_command_send_message(int socket)
 	Packet pkt;
 	pkt.type = MessageType::SEND_MESSAGE_REQUEST;
 	pkt.content = json{{"target_id", target_id}, {"message", message}}.dump();
-	send_packet(socket, pkt);
+	send_packet(socket, secure_session, pkt);
 }
 
-void on_command_send_file(int socket)
+void on_command_send_file(int socket, SecureSession &secure_session)
 {
     uint64_t target_id;
     std::string filepath, temp_id_input;
@@ -412,24 +648,24 @@ void on_command_send_file(int socket)
         pkt.content = create_file_transfer_payload(
             target_id, total_size, bytes_sent, false, filename, chunk_data);
 
-        if (!send_packet(socket, pkt)) return;
+        if (!send_packet(socket, secure_session, pkt)) return;
     }
 
     Packet end_pkt;
     end_pkt.type = MessageType::SEND_FILE_REQUEST;
     end_pkt.content = create_file_transfer_payload(
         target_id, total_size, total_size, true, filename, "");
-    send_packet(socket, end_pkt);
+    send_packet(socket, secure_session, end_pkt);
 
     LOG(INFO) << "[Cmd] File sent complete.";
 }
 
-void on_command_disconnect(int socket)
+void on_command_disconnect(int socket, SecureSession &secure_session)
 {
 	LOG(INFO) << "[Cmd] Sending disconnect request...";
 	Packet pkt;
 	pkt.type = MessageType::DISCONNECT_REQUEST;
-	send_packet(socket, pkt);
+	send_packet(socket, secure_session, pkt);
 
 	g_client_running = false;
 	g_cv.notify_all();
@@ -442,47 +678,418 @@ void on_force_exit()
 	g_cv.notify_all();
 }
 
-int main(int argc, char *argv[])
+void print_usage(const char *program)
 {
-	auto glog = GlogWrapper(argv[0]);
+	std::cerr
+	    << "Usage:\n"
+	    << "  " << program << " [server_ip]\n"
+	    << "  " << program << " [options] destination command [argument ...]\n"
+	    << "\n"
+	    << "Remote command mode follows the common ssh shape. destination is a "
+	       "client ID,\n"
+	    << "or user@client_id for syntax compatibility.\n"
+	    << "\n"
+	    << "Options:\n"
+	    << "  --server HOST      Relay server address (default 127.0.0.1)\n"
+	    << "  -p PORT           Relay server port (default 4468)\n"
+	    << "  -l USER           Accept user@host style login name; currently ignored\n"
+	    << "  -n                Do not read from stdin\n"
+	    << "  -T                Disable pseudo-terminal allocation\n"
+	    << "  -t                Accepted for ssh compatibility; PTY is not implemented\n"
+	    << "  -q                Quiet mode\n"
+	    << "  -o OPTION         Accept ssh-style options; RemoteCommandTimeout=N is supported\n"
+	    << "  -h, --help        Show this help\n";
+}
 
-	signal(SIGINT, client_signal_handler);
+bool parse_u64(const std::string &value, uint64_t &out)
+{
+	if (value.empty()) {
+		return false;
+	}
+	for (unsigned char ch : value) {
+		if (!std::isdigit(ch)) {
+			return false;
+		}
+	}
+	try {
+		out = std::stoull(value);
+		return out > 0;
+	} catch (...) {
+		return false;
+	}
+}
 
-	std::string target_ip = SERVER_ADDRESS; // Default is 127.0.0.1
-	if (argc > 1) {
-		target_ip = argv[1];
+bool parse_int_range(const std::string &value, int min_value, int max_value,
+                     int &out)
+{
+	uint64_t parsed = 0;
+	if (!parse_u64(value, parsed) || parsed > static_cast<uint64_t>(max_value) ||
+	    parsed < static_cast<uint64_t>(min_value)) {
+		return false;
+	}
+	out = static_cast<int>(parsed);
+	return true;
+}
+
+std::string destination_host_part(const std::string &destination)
+{
+	size_t at_pos = destination.rfind('@');
+	if (at_pos == std::string::npos) {
+		return destination;
+	}
+	return destination.substr(at_pos + 1);
+}
+
+std::string join_command_arguments(int start, int argc, char *argv[])
+{
+	std::ostringstream oss;
+	for (int i = start; i < argc; ++i) {
+		if (i != start) {
+			oss << ' ';
+		}
+		oss << argv[i];
+	}
+	return oss.str();
+}
+
+bool apply_ssh_option(const std::string &option, RemoteExecOptions &options)
+{
+	auto equals = option.find('=');
+	std::string key = equals == std::string::npos
+	                      ? option
+	                      : option.substr(0, equals);
+	std::string value = equals == std::string::npos
+	                        ? ""
+	                        : option.substr(equals + 1);
+	if (key == "RemoteCommandTimeout") {
+		int timeout = 0;
+		if (!parse_int_range(value, 0, 86400, timeout)) {
+			std::cerr << "Invalid RemoteCommandTimeout: " << value << "\n";
+			return false;
+		}
+		options.timeout_seconds = static_cast<uint32_t>(timeout);
+	}
+	return true;
+}
+
+bool parse_client_arguments(int argc, char *argv[], RemoteExecOptions &options)
+{
+	if (const char *server_env = std::getenv("SOCKET_SERVER")) {
+		if (*server_env != '\0') {
+			options.server_ip = server_env;
+		}
 	}
 
-	int client_socket;
-	struct sockaddr_in server_address;
+	int i = 1;
+	bool options_done = false;
+	for (; i < argc; ++i) {
+		std::string arg = argv[i];
+		if (options_done || arg.empty() || arg[0] != '-' || arg == "-") {
+			break;
+		}
+		if (arg == "--") {
+			options_done = true;
+			continue;
+		}
+		if (arg == "-h" || arg == "--help") {
+			options.show_help = true;
+			return true;
+		}
+		if (arg == "--server") {
+			if (++i >= argc) {
+				std::cerr << "--server requires an argument\n";
+				return false;
+			}
+			options.server_ip = argv[i];
+			continue;
+		}
+		if (arg == "-p" || arg == "-l" || arg == "-o") {
+			if (++i >= argc) {
+				std::cerr << arg << " requires an argument\n";
+				return false;
+			}
+			if (arg == "-p") {
+				int port = 0;
+				if (!parse_int_range(argv[i], 1, 65535, port)) {
+					std::cerr << "Invalid port: " << argv[i] << "\n";
+					return false;
+				}
+				options.server_port = port;
+			} else if (arg == "-o" &&
+			           !apply_ssh_option(argv[i], options)) {
+				return false;
+			}
+			continue;
+		}
+		if (arg == "-n") {
+			options.forward_stdin = false;
+			continue;
+		}
+		if (arg == "-T") {
+			options.request_tty = false;
+			continue;
+		}
+		bool only_t = arg.size() > 1;
+		for (size_t j = 1; j < arg.size(); ++j) {
+			if (arg[j] != 't') {
+				only_t = false;
+				break;
+			}
+		}
+		if (only_t) {
+			options.request_tty = true;
+			continue;
+		}
+		if (arg == "-q") {
+			options.quiet = true;
+			continue;
+		}
+		std::cerr << "Unsupported option: " << arg << "\n";
+		return false;
+	}
 
-	// 1. Create socket
+	int remaining = argc - i;
+	if (remaining <= 0) {
+		options.enabled = false;
+		return true;
+	}
+
+	if (remaining == 1) {
+		uint64_t maybe_target = 0;
+		std::string host = destination_host_part(argv[i]);
+		if (parse_u64(host, maybe_target)) {
+			std::cerr << "Interactive remote login is not implemented; "
+			          << "provide a command.\n";
+			return false;
+		}
+		options.server_ip = argv[i];
+		options.enabled = false;
+		return true;
+	}
+
+	options.enabled = true;
+	options.destination = argv[i];
+	std::string host = destination_host_part(options.destination);
+	if (!parse_u64(host, options.target_id)) {
+		std::cerr << "Destination must be a connected client ID: "
+		          << options.destination << "\n";
+		return false;
+	}
+	options.command = join_command_arguments(i + 1, argc, argv);
+	if (options.command.empty()) {
+		std::cerr << "Missing remote command\n";
+		return false;
+	}
+	return true;
+}
+
+bool connect_secure(const RemoteExecOptions &options, int &client_socket,
+                    SecureSession &secure_session)
+{
+	struct sockaddr_in server_address;
 	client_socket = socket(AF_INET, SOCK_STREAM, 0);
 	if (client_socket < 0) {
 		LOG(ERROR) << "[Error] Failed to create socket";
-		return -1;
+		return false;
 	}
 
-	// 2. Set server address
 	memset(&server_address, 0, sizeof(server_address));
 	server_address.sin_family = AF_INET;
-	// server_address.sin_addr.s_addr = inet_addr(SERVER_ADDRESS);
-	server_address.sin_addr.s_addr = inet_addr(target_ip.c_str());
-	server_address.sin_port = htons(SERVER_PORT);
+	server_address.sin_addr.s_addr = inet_addr(options.server_ip.c_str());
+	server_address.sin_port = htons(options.server_port);
 
-	// 3. Connect to server
 	if (connect(client_socket, (struct sockaddr *)&server_address,
 	            sizeof(server_address)) < 0) {
 		LOG(ERROR) << "[Error] Connection failed";
+		close(client_socket);
+		return false;
+	}
+
+	LOG(INFO) << "[Info] Connected to server at " << options.server_ip << ":"
+	          << options.server_port;
+
+	if (!perform_client_handshake(client_socket, secure_session)) {
+		LOG(ERROR) << "[Error] Secure handshake failed";
+		close(client_socket);
+		return false;
+	}
+	LOG(INFO) << "[Info] Secure channel established.";
+	return true;
+}
+
+bool write_all_fd(int fd, const std::string &data)
+{
+	size_t written_total = 0;
+	while (written_total < data.size()) {
+		ssize_t written =
+		    write(fd, data.data() + written_total,
+		          data.size() - written_total);
+		if (written > 0) {
+			written_total += static_cast<size_t>(written);
+			continue;
+		}
+		if (written < 0 && errno == EINTR) {
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+bool send_shell_stdin(int socket, SecureSession &secure_session,
+                      uint64_t target_id, uint64_t request_id, bool eof,
+                      const std::string &data)
+{
+	Packet pkt;
+	pkt.type = MessageType::SHELL_EXEC_STDIN;
+	pkt.content =
+	    create_shell_exec_stdin_payload(target_id, request_id, eof, data);
+	return send_packet(socket, secure_session, pkt);
+}
+
+void stream_local_stdin(int socket, SecureSession *secure_session,
+                        uint64_t target_id, uint64_t request_id)
+{
+	std::string buffer(SHELL_STREAM_CHUNK_SIZE, '\0');
+	while (g_client_running) {
+		ssize_t count = read(STDIN_FILENO, buffer.data(), buffer.size());
+		if (count > 0) {
+			if (!send_shell_stdin(socket, *secure_session, target_id,
+			                      request_id, false,
+			                      std::string(buffer.data(), count))) {
+				return;
+			}
+			continue;
+		}
+		if (count < 0 && errno == EINTR) {
+			continue;
+		}
+		break;
+	}
+	send_shell_stdin(socket, *secure_session, target_id, request_id, true, "");
+}
+
+int normalize_remote_exit_code(const ShellExecResultPayload &result)
+{
+	if (result.exit_code >= 0 && result.exit_code <= 255) {
+		return result.exit_code;
+	}
+	return 255;
+}
+
+int run_remote_exec(int client_socket, SecureSession &secure_session,
+                    const RemoteExecOptions &options)
+{
+	if (options.request_tty && !options.quiet) {
+		std::cerr << "Pseudo-terminal allocation is not implemented; "
+		          << "running without a PTY.\n";
+	}
+
+	uint64_t request_id = g_next_shell_request_id.fetch_add(1);
+	Packet request_pkt;
+	request_pkt.type = MessageType::SHELL_EXEC_REQUEST;
+	request_pkt.content = create_shell_exec_request_payload(
+	    options.target_id, request_id, options.timeout_seconds,
+	    options.command);
+	if (!send_packet(client_socket, secure_session, request_pkt)) {
+		return 255;
+	}
+
+	bool should_forward_stdin =
+	    options.forward_stdin && !isatty(STDIN_FILENO);
+	if (should_forward_stdin) {
+		std::thread(stream_local_stdin, client_socket, &secure_session,
+		            options.target_id, request_id)
+		    .detach();
+	} else {
+		send_shell_stdin(client_socket, secure_session, options.target_id,
+		                 request_id, true, "");
+	}
+
+	while (g_client_running) {
+		Packet pkt;
+		if (!read_secure_packet(client_socket, secure_session, pkt)) {
+			std::cerr << "Connection closed before remote command finished\n";
+			return 255;
+		}
+
+		switch (pkt.type) {
+		case MessageType::SHELL_EXEC_OUTPUT: {
+			ShellExecOutputPayload output;
+			if (!parse_shell_exec_output_payload(pkt.content, output) ||
+			    output.request_id != request_id ||
+			    output.peer_id != options.target_id) {
+				continue;
+			}
+			int fd = output.stream == ShellOutputStream::STDOUT
+			             ? STDOUT_FILENO
+			             : STDERR_FILENO;
+			if (!write_all_fd(fd, output.data)) {
+				return 255;
+			}
+			break;
+		}
+		case MessageType::SHELL_EXEC_RESULT: {
+			ShellExecResultPayload result;
+			if (!parse_shell_exec_result_payload(pkt.content, result) ||
+			    result.request_id != request_id ||
+			    result.peer_id != options.target_id) {
+				continue;
+			}
+			if (result.timed_out || result.message != "completed") {
+				if (!result.message.empty()) {
+					std::cerr << result.message << "\n";
+				}
+			}
+			return normalize_remote_exit_code(result);
+		}
+		case MessageType::SERVER_SHUTDOWN_INDICATION:
+			std::cerr << "Server shut down before remote command finished\n";
+			return 255;
+		default:
+			break;
+		}
+	}
+	return 255;
+}
+
+int main(int argc, char *argv[])
+{
+	RemoteExecOptions options;
+	if (!parse_client_arguments(argc, argv, options)) {
+		print_usage(argv[0]);
+		return 2;
+	}
+	if (options.show_help) {
+		print_usage(argv[0]);
+		return 0;
+	}
+
+	auto glog = GlogWrapper(argv[0], !options.enabled);
+
+	signal(SIGINT, client_signal_handler);
+	signal(SIGPIPE, SIG_IGN);
+
+	int client_socket;
+	SecureSession secure_session;
+	if (!connect_secure(options, client_socket, secure_session)) {
 		return -1;
 	}
 
-	LOG(INFO) << "[Info] Connected to server at " << SERVER_ADDRESS << ":"
-	          << SERVER_PORT;
+	if (options.enabled) {
+		int exit_code =
+		    run_remote_exec(client_socket, secure_session, options);
+		g_client_running = false;
+		shutdown(client_socket, SHUT_RDWR);
+		close(client_socket);
+		return exit_code;
+	}
 
 	// Launch the background receiver and presenter threads
-	std::thread receiver_thread(receive_messages, client_socket);
-	std::thread presenter_thread(present_messages);
+	std::thread receiver_thread(receive_messages, client_socket,
+	                            &secure_session);
+	std::thread presenter_thread(present_messages, client_socket,
+	                             &secure_session);
 
 	// Main loop for handling user input
 	// Uses select() to avoid blocking on std::getline
@@ -507,17 +1114,17 @@ int main(int argc, char *argv[])
 				if (command == "help") {
 					on_command_help();
 				} else if (command == "time") {
-					on_command_get_time(client_socket);
+					on_command_get_time(client_socket, secure_session);
 				} else if (command == "name") {
-					on_command_get_name(client_socket);
+					on_command_get_name(client_socket, secure_session);
 				} else if (command == "list") {
-					on_command_get_list(client_socket);
+					on_command_get_list(client_socket, secure_session);
 				} else if (command == "send") {
-					on_command_send_message(client_socket);
+					on_command_send_message(client_socket, secure_session);
 				} else if (command == "sendfile") {
-					on_command_send_file(client_socket);
+					on_command_send_file(client_socket, secure_session);
 				} else if (command == "disconnect") {
-					on_command_disconnect(client_socket);
+					on_command_disconnect(client_socket, secure_session);
 				} else if (command.empty()) {
 				} else {
 					std::cout << "[Error] Unknown command: '"

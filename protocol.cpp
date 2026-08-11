@@ -121,6 +121,10 @@ bool read_packet(int socket, Packet& pkt)
 	uint32_t payload_len_n = 0;
 	memcpy(&payload_len_n, packet_data_buffer.data() + 8, sizeof(payload_len_n));
 	uint32_t payload_len = ntohl(payload_len_n);
+	if (payload_len != total_len - HEADER_SIZE) {
+		LOG(ERROR) << "[Error] Packet payload length mismatch.";
+		return false;
+	}
 	if (payload_len > 0) {
 		pkt.content.assign(packet_data_buffer.data() + HEADER_SIZE, payload_len);
 	} else {
@@ -136,12 +140,16 @@ const char* MessageTypeToString(MessageType type) {
 	// Note: A switch statement would be slightly more performant, but a map is more concise.
 	static const std::map<MessageType, const char*> type_map = {
 		{MessageType::UNDEFINED, "UNDEFINED"},
+		{MessageType::KEY_EXCHANGE, "KEY_EXCHANGE"},
+		{MessageType::ENCRYPTED_PACKET, "ENCRYPTED_PACKET"},
 		{MessageType::GET_TIME_REQUEST, "GET_TIME_REQUEST"},
 		{MessageType::GET_NAME_REQUEST, "GET_NAME_REQUEST"},
 		{MessageType::GET_CLIENT_LIST_REQUEST, "GET_CLIENT_LIST_REQUEST"},
 		{MessageType::SEND_MESSAGE_REQUEST, "SEND_MESSAGE_REQUEST"},
 		{MessageType::SEND_FILE_REQUEST, "SEND_FILE_REQUEST"},
 		{MessageType::DISCONNECT_REQUEST, "DISCONNECT_REQUEST"},
+		{MessageType::SHELL_EXEC_REQUEST, "SHELL_EXEC_REQUEST"},
+		{MessageType::SHELL_EXEC_STDIN, "SHELL_EXEC_STDIN"},
 		{MessageType::GET_TIME_RESPONSE, "GET_TIME_RESPONSE"},
 		{MessageType::GET_NAME_RESPONSE, "GET_NAME_RESPONSE"},
 		{MessageType::GET_CLIENT_LIST_RESPONSE, "GET_CLIENT_LIST_RESPONSE"},
@@ -151,6 +159,8 @@ const char* MessageTypeToString(MessageType type) {
 		{MessageType::SERVER_SHUTDOWN_INDICATION, "SERVER_SHUTDOWN_INDICATION"},
 		{MessageType::SYSTEM_NOTICE_INDICATION, "SYSTEM_NOTICE_INDICATION"},
 		{MessageType::FILE_INDICATION, "FILE_INDICATION"},
+		{MessageType::SHELL_EXEC_OUTPUT, "SHELL_EXEC_OUTPUT"},
+		{MessageType::SHELL_EXEC_RESULT, "SHELL_EXEC_RESULT"},
 	};
 
 	auto it = type_map.find(type);

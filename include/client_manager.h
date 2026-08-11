@@ -11,6 +11,7 @@
 #include <optional>
 #include "client_info.h"
 #include "protocol.h"       // For Packet
+#include "secure_channel.h"
 #include <arpa/inet.h>      // For htonl, ntohl
 #include <unistd.h>         // For close
 #include <glog/logging.h>
@@ -33,7 +34,8 @@ public:
      * @param port The new client's port.
      * @return The unique client_id assigned to this client.
      */
-    int add_client(int socket_fd, const std::string& ip_address, int port) {
+    int add_client(int socket_fd, const std::string& ip_address, int port,
+                   SecureSession secure_session) {
         int client_id = next_client_id_.fetch_add(1);
 
         auto connection = std::make_shared<ClientConnection>();
@@ -41,6 +43,7 @@ public:
         connection->info.socket_fd = socket_fd;
         connection->info.ip_address = ip_address;
         connection->info.port = port;
+        connection->secure_session = secure_session;
 
         std::lock_guard<std::mutex> lock(clients_mutex_);
         clients_[client_id] = connection;
@@ -129,11 +132,9 @@ public:
             return false;
         }
 
-        std::vector<char> message_stream = create_message_stream(pkt);
-
         std::lock_guard<std::mutex> send_lock(connection->send_mutex);
-        if (!send_all(connection->info.socket_fd, message_stream.data(),
-                      message_stream.size())) {
+        if (!send_secure_packet(connection->info.socket_fd,
+                                connection->secure_session, pkt)) {
             LOG(ERROR) << "[ClientManager] Failed to send message to Client ID "
                        << client_id << " (FD: " << connection->info.socket_fd << ")";
             // We might want to trigger a removal here, but for now we'll let
@@ -146,6 +147,7 @@ public:
 private:
     struct ClientConnection {
         ClientInfo info;
+        SecureSession secure_session;
         std::mutex send_mutex;
     };
 
