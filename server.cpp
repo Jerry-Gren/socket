@@ -12,7 +12,10 @@
 #include <sys/select.h>    // For select()
 #include <cerrno>          // For errno
 #include <nlohmann/json.hpp>
+#include <condition_variable>
+#include <deque>
 #include <map>
+#include <memory>
 
 #include <chrono>
 #include <cmath>
@@ -43,6 +46,27 @@ struct TransferProgressState {
 	std::chrono::steady_clock::time_point started_at;
 };
 
+struct ShellInputKey {
+	uint64_t peer_id = 0;
+	uint64_t request_id = 0;
+
+	bool operator<(const ShellInputKey &other) const
+	{
+		if (peer_id != other.peer_id) return peer_id < other.peer_id;
+		return request_id < other.request_id;
+	}
+};
+
+struct ShellInputQueue {
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::deque<ShellInputChunk> chunks;
+	bool closed = false;
+};
+
+std::mutex g_shell_input_mutex;
+std::map<ShellInputKey, std::shared_ptr<ShellInputQueue>> g_shell_inputs;
+
 // Signal handler function
 // Called when SIGINT (Ctrl+C) or SIGTERM (kill) is received
 void signal_handler(int signum)
@@ -50,6 +74,82 @@ void signal_handler(int signum)
 	LOG(INFO) << "[Info] Interrupt signal (" << signum
 	          << ") received. Shutting down...";
 	g_server_running = false;
+}
+
+std::shared_ptr<ShellInputQueue> register_shell_input_queue(
+    const ShellInputKey &key)
+{
+	auto queue = std::make_shared<ShellInputQueue>();
+	std::lock_guard<std::mutex> lock(g_shell_input_mutex);
+	g_shell_inputs[key] = queue;
+	return queue;
+}
+
+void unregister_shell_input_queue(const ShellInputKey &key)
+{
+	std::shared_ptr<ShellInputQueue> queue;
+	{
+		std::lock_guard<std::mutex> lock(g_shell_input_mutex);
+		auto it = g_shell_inputs.find(key);
+		if (it == g_shell_inputs.end()) {
+			return;
+		}
+		queue = it->second;
+		g_shell_inputs.erase(it);
+	}
+	{
+		std::lock_guard<std::mutex> lock(queue->mutex);
+		queue->closed = true;
+	}
+	queue->cv.notify_all();
+}
+
+bool push_shell_input(const ShellInputKey &key,
+                      const ShellExecStdinPayload &payload)
+{
+	std::shared_ptr<ShellInputQueue> queue;
+	{
+		std::lock_guard<std::mutex> lock(g_shell_input_mutex);
+		auto it = g_shell_inputs.find(key);
+		if (it == g_shell_inputs.end()) {
+			return false;
+		}
+		queue = it->second;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(queue->mutex);
+		if (queue->closed) {
+			return false;
+		}
+		queue->chunks.push_back(ShellInputChunk{payload.eof, payload.data});
+		if (payload.eof) {
+			queue->closed = true;
+		}
+	}
+	queue->cv.notify_one();
+	return true;
+}
+
+bool pop_shell_input(const std::shared_ptr<ShellInputQueue> &queue,
+                     ShellInputChunk &chunk,
+                     std::chrono::milliseconds max_wait)
+{
+	std::unique_lock<std::mutex> lock(queue->mutex);
+	if (queue->chunks.empty() && !queue->closed && max_wait.count() > 0) {
+		queue->cv.wait_for(lock, max_wait);
+	}
+	if (queue->chunks.empty()) {
+		if (queue->closed) {
+			chunk.eof = true;
+			chunk.data.clear();
+			return true;
+		}
+		return false;
+	}
+	chunk = std::move(queue->chunks.front());
+	queue->chunks.pop_front();
+	return true;
 }
 
 std::string get_current_time_str()
@@ -227,6 +327,41 @@ void handle_send_file_request(int client_id, const std::string &content)
 	g_client_manager.send_to_client(target_id, forward_pkt);
 }
 
+void run_server_shell_exec_request(int client_id,
+                                   ShellExecRequestPayload request,
+                                   std::shared_ptr<ShellInputQueue> input_queue)
+{
+	ShellInputKey input_key{static_cast<uint64_t>(client_id),
+	                       request.request_id};
+
+	auto on_output = [&](ShellOutputStream stream, const std::string &data) {
+		if (!g_server_running || data.empty()) {
+			return;
+		}
+		Packet output_pkt;
+		output_pkt.type = MessageType::SHELL_EXEC_OUTPUT;
+		output_pkt.content = create_shell_exec_output_payload(
+		    0, request.request_id, stream, data);
+		g_client_manager.send_to_client(client_id, output_pkt);
+	};
+
+	auto on_input = [&](ShellInputChunk &chunk,
+	                    std::chrono::milliseconds max_wait) {
+		return pop_shell_input(input_queue, chunk, max_wait);
+	};
+
+	ShellExecResultPayload result =
+	    execute_shell_command(request, on_output, on_input);
+	unregister_shell_input_queue(input_key);
+
+	Packet result_pkt;
+	result_pkt.type = MessageType::SHELL_EXEC_RESULT;
+	result_pkt.content = create_shell_exec_result_payload(
+	    0, request.request_id, result.exit_code, result.timed_out,
+	    result.message);
+	g_client_manager.send_to_client(client_id, result_pkt);
+}
+
 void handle_shell_exec_request(int client_id, const std::string &content)
 {
 	ShellExecRequestPayload request;
@@ -236,6 +371,16 @@ void handle_shell_exec_request(int client_id, const std::string &content)
 	}
 
 	uint64_t target_id = request.peer_id;
+	if (target_id == 0) {
+		auto input_queue = register_shell_input_queue(
+		    ShellInputKey{static_cast<uint64_t>(client_id),
+		                  request.request_id});
+		std::thread(run_server_shell_exec_request, client_id, request,
+		            input_queue)
+		    .detach();
+		return;
+	}
+
 	if (!g_client_manager.get_client(target_id).has_value()) {
 		Packet result_pkt;
 		result_pkt.type = MessageType::SHELL_EXEC_RESULT;
@@ -263,6 +408,13 @@ void handle_shell_exec_stdin(int client_id, const std::string &content)
 	}
 
 	uint64_t target_id = input.peer_id;
+	if (target_id == 0) {
+		push_shell_input(
+		    ShellInputKey{static_cast<uint64_t>(client_id), input.request_id},
+		    input);
+		return;
+	}
+
 	if (!g_client_manager.get_client(target_id).has_value()) {
 		return;
 	}

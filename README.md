@@ -8,17 +8,25 @@ This repository contains an implementation of a custom communication protocol us
 
 ## Remote Command Mode
 
-Keep one client connected as the command target, then run one-off commands from
-another client using an ssh-like shape:
+Run `server` on the controlled host, then run one-off commands from another
+machine using an ssh-like shape. The controlled host does not need a separate
+long-running `client` process:
 
 ```sh
-./client 1 uname -a
-printf 'hello' | ./client 1 wc -c
-./client -n 1 'uptime; id'
-./client --server 192.168.0.10 -p 4468 user@1 'echo "$SHELL"'
+./client 192.168.0.107 uname -a
+printf 'hello' | ./client 192.168.0.107 wc -c
+./client -n user@192.168.0.107 'uptime; id'
+./client -p 4468 localhost 'echo "$SHELL"'
 ```
 
-The destination is the target client ID. `user@ID` is accepted for command-line
-compatibility, but the user name is not authenticated or used by this relay
-protocol. Remote stdout and stderr are written to the local stdout and stderr,
-and the client exits with the remote command exit code.
+The destination is the server host or `user@server_host`. The user name is
+accepted for command-line compatibility, but it is not authenticated or used by
+this protocol yet. Remote stdout and stderr are written to the local stdout and
+stderr, and the client exits with the remote command exit code.
+
+The older relay mode is still available when a command must run on a connected
+client behind the server:
+
+```sh
+./client --server relay.example.net --target-client 3 uname -a
+```

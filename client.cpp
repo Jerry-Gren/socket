@@ -6,6 +6,7 @@
 #include <sys/socket.h>    // For socket functions
 #include <netinet/in.h>    // For sockaddr_in
 #include <arpa/inet.h>     // For inet_addr()
+#include <netdb.h>         // For getaddrinfo()
 #include <thread>          // For threading
 #include <mutex>           // For std::mutex
 #include <condition_variable> // For std::condition_variable
@@ -73,6 +74,7 @@ struct RemoteExecOptions {
 	bool forward_stdin = true;
 	bool quiet = false;
 	bool request_tty = false;
+	bool relay_to_client = false;
 	uint32_t timeout_seconds = 0;
 	int server_port = SERVER_PORT;
 	std::string server_ip = SERVER_ADDRESS;
@@ -686,13 +688,14 @@ void print_usage(const char *program)
 	    << "  " << program << " [options] destination command [argument ...]\n"
 	    << "\n"
 	    << "Remote command mode follows the common ssh shape. destination is a "
-	       "client ID,\n"
-	    << "or user@client_id for syntax compatibility.\n"
+	       "server host\n"
+	    << "or user@server_host. The command runs on that server host.\n"
 	    << "\n"
 	    << "Options:\n"
-	    << "  --server HOST      Relay server address (default 127.0.0.1)\n"
-	    << "  -p PORT           Relay server port (default 4468)\n"
-	    << "  -l USER           Accept user@host style login name; currently ignored\n"
+	    << "  --server HOST      Relay server address for --target-client mode\n"
+	    << "  --target-client ID Execute on a connected client through the relay\n"
+	    << "  -p PORT           Server port (default 4468)\n"
+	    << "  -l USER           Accept ssh-style login name; currently ignored\n"
 	    << "  -n                Do not read from stdin\n"
 	    << "  -T                Disable pseudo-terminal allocation\n"
 	    << "  -t                Accepted for ssh compatibility; PTY is not implemented\n"
@@ -795,12 +798,21 @@ bool parse_client_arguments(int argc, char *argv[], RemoteExecOptions &options)
 			options.show_help = true;
 			return true;
 		}
-		if (arg == "--server") {
+		if (arg == "--server" || arg == "--target-client") {
 			if (++i >= argc) {
-				std::cerr << "--server requires an argument\n";
+				std::cerr << arg << " requires an argument\n";
 				return false;
 			}
-			options.server_ip = argv[i];
+			if (arg == "--server") {
+				options.server_ip = argv[i];
+			} else {
+				if (!parse_u64(argv[i], options.target_id)) {
+					std::cerr << "Invalid target client ID: " << argv[i]
+					          << "\n";
+					return false;
+				}
+				options.relay_to_client = true;
+			}
 			continue;
 		}
 		if (arg == "-p" || arg == "-l" || arg == "-o") {
@@ -850,6 +862,10 @@ bool parse_client_arguments(int argc, char *argv[], RemoteExecOptions &options)
 
 	int remaining = argc - i;
 	if (remaining <= 0) {
+		if (options.relay_to_client) {
+			std::cerr << "Missing remote command\n";
+			return false;
+		}
 		options.enabled = false;
 		return true;
 	}
@@ -857,7 +873,7 @@ bool parse_client_arguments(int argc, char *argv[], RemoteExecOptions &options)
 	if (remaining == 1) {
 		uint64_t maybe_target = 0;
 		std::string host = destination_host_part(argv[i]);
-		if (parse_u64(host, maybe_target)) {
+		if (options.relay_to_client || parse_u64(host, maybe_target)) {
 			std::cerr << "Interactive remote login is not implemented; "
 			          << "provide a command.\n";
 			return false;
@@ -868,12 +884,24 @@ bool parse_client_arguments(int argc, char *argv[], RemoteExecOptions &options)
 	}
 
 	options.enabled = true;
+	if (options.relay_to_client) {
+		options.command = join_command_arguments(i, argc, argv);
+		if (options.command.empty()) {
+			std::cerr << "Missing remote command\n";
+			return false;
+		}
+		return true;
+	}
+
 	options.destination = argv[i];
 	std::string host = destination_host_part(options.destination);
-	if (!parse_u64(host, options.target_id)) {
-		std::cerr << "Destination must be a connected client ID: "
-		          << options.destination << "\n";
-		return false;
+	uint64_t legacy_target_id = 0;
+	if (parse_u64(host, legacy_target_id)) {
+		options.relay_to_client = true;
+		options.target_id = legacy_target_id;
+	} else {
+		options.server_ip = host;
+		options.target_id = 0;
 	}
 	options.command = join_command_arguments(i + 1, argc, argv);
 	if (options.command.empty()) {
@@ -886,22 +914,39 @@ bool parse_client_arguments(int argc, char *argv[], RemoteExecOptions &options)
 bool connect_secure(const RemoteExecOptions &options, int &client_socket,
                     SecureSession &secure_session)
 {
-	struct sockaddr_in server_address;
-	client_socket = socket(AF_INET, SOCK_STREAM, 0);
-	if (client_socket < 0) {
-		LOG(ERROR) << "[Error] Failed to create socket";
+	struct addrinfo hints;
+	struct addrinfo *results = nullptr;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+
+	std::string port = std::to_string(options.server_port);
+	int gai_result = getaddrinfo(options.server_ip.c_str(), port.c_str(),
+	                             &hints, &results);
+	if (gai_result != 0) {
+		LOG(ERROR) << "[Error] Failed to resolve " << options.server_ip
+		           << ": " << gai_strerror(gai_result);
 		return false;
 	}
 
-	memset(&server_address, 0, sizeof(server_address));
-	server_address.sin_family = AF_INET;
-	server_address.sin_addr.s_addr = inet_addr(options.server_ip.c_str());
-	server_address.sin_port = htons(options.server_port);
+	client_socket = -1;
+	for (struct addrinfo *addr = results; addr != nullptr;
+	     addr = addr->ai_next) {
+		int candidate =
+		    socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+		if (candidate < 0) {
+			continue;
+		}
+		if (connect(candidate, addr->ai_addr, addr->ai_addrlen) == 0) {
+			client_socket = candidate;
+			break;
+		}
+		close(candidate);
+	}
+	freeaddrinfo(results);
 
-	if (connect(client_socket, (struct sockaddr *)&server_address,
-	            sizeof(server_address)) < 0) {
+	if (client_socket < 0) {
 		LOG(ERROR) << "[Error] Connection failed";
-		close(client_socket);
 		return false;
 	}
 
