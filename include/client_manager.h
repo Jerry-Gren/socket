@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <memory>
 #include <optional>
 #include "client_info.h"
 #include "protocol.h"       // For Packet
@@ -35,14 +36,14 @@ public:
     int add_client(int socket_fd, const std::string& ip_address, int port) {
         int client_id = next_client_id_.fetch_add(1);
 
-        ClientInfo new_client;
-        new_client.client_id = client_id;
-        new_client.socket_fd = socket_fd;
-        new_client.ip_address = ip_address;
-        new_client.port = port;
+        auto connection = std::make_shared<ClientConnection>();
+        connection->info.client_id = client_id;
+        connection->info.socket_fd = socket_fd;
+        connection->info.ip_address = ip_address;
+        connection->info.port = port;
 
         std::lock_guard<std::mutex> lock(clients_mutex_);
-        clients_[client_id] = new_client;
+        clients_[client_id] = connection;
 
         LOG(INFO) << "[ClientManager] Client " << client_id << " (FD: "
                   << socket_fd << ", IP: " << ip_address << ":" << port
@@ -56,15 +57,21 @@ public:
      * @param client_id The ID of the client to remove.
      */
     void remove_client(int client_id) {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
+        std::shared_ptr<ClientConnection> connection;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            auto it = clients_.find(client_id);
+            if (it != clients_.end()) {
+                connection = it->second;
+                clients_.erase(it);
+            }
+        }
 
-        auto it = clients_.find(client_id);
-        if (it != clients_.end()) {
-            // Close the socket when removing the client
-            close(it->second.socket_fd);
+        if (connection) {
+            std::lock_guard<std::mutex> send_lock(connection->send_mutex);
+            close(connection->info.socket_fd);
             LOG(INFO) << "[ClientManager] Client " << client_id
-                      << " (FD: " << it->second.socket_fd << ") disconnected.";
-            clients_.erase(it);
+                      << " (FD: " << connection->info.socket_fd << ") disconnected.";
         } else {
             LOG(WARNING) << "[ClientManager] Attempted to remove non-existent client ID: "
                          << client_id;
@@ -81,7 +88,7 @@ public:
         std::lock_guard<std::mutex> lock(clients_mutex_);
         auto it = clients_.find(client_id);
         if (it != clients_.end()) {
-            return it->second;
+            return it->second->info;
         }
         return std::nullopt;
     }
@@ -94,7 +101,7 @@ public:
         std::lock_guard<std::mutex> lock(clients_mutex_);
         std::vector<ClientInfo> client_list;
         for (const auto& pair : clients_) {
-            client_list.push_back(pair.second);
+            client_list.push_back(pair.second->info);
         }
         return client_list;
     }
@@ -107,8 +114,16 @@ public:
      * client was not found.
      */
     bool send_to_client(int client_id, const Packet& pkt) {
-        std::optional<ClientInfo> client = get_client(client_id);
-        if (!client) {
+        std::shared_ptr<ClientConnection> connection;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            auto it = clients_.find(client_id);
+            if (it != clients_.end()) {
+                connection = it->second;
+            }
+        }
+
+        if (!connection) {
             LOG(WARNING) << "[ClientManager] Failed to send: Client ID "
                          << client_id << " not found.";
             return false;
@@ -116,11 +131,11 @@ public:
 
         std::vector<char> message_stream = create_message_stream(pkt);
 
-        // Note: This send operation is blocking and is done while holding
-        // no locks on the manager, which is good.
-        if (send(client->socket_fd, message_stream.data(), message_stream.size(), 0) < 0) {
+        std::lock_guard<std::mutex> send_lock(connection->send_mutex);
+        if (!send_all(connection->info.socket_fd, message_stream.data(),
+                      message_stream.size())) {
             LOG(ERROR) << "[ClientManager] Failed to send message to Client ID "
-                       << client_id << " (FD: " << client->socket_fd << ")";
+                       << client_id << " (FD: " << connection->info.socket_fd << ")";
             // We might want to trigger a removal here, but for now we'll let
             // the client's own handler thread detect the disconnect.
             return false;
@@ -129,7 +144,12 @@ public:
     }
 
 private:
-    std::map<int, ClientInfo> clients_; // Map from client_id to ClientInfo
+    struct ClientConnection {
+        ClientInfo info;
+        std::mutex send_mutex;
+    };
+
+    std::map<int, std::shared_ptr<ClientConnection>> clients_; // Map from client_id to connection
     std::mutex clients_mutex_;           // Mutex to protect the clients_ map
     std::atomic<uint64_t> next_client_id_;  // Atomic counter for unique client IDs
 };

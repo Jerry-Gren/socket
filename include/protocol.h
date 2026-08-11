@@ -1,7 +1,7 @@
 #ifndef PROTOCOL_H_
 #define PROTOCOL_H_
 
-#define MAX_PACKET_SIZE 65536
+#define MAX_PACKET_SIZE (2 * 1024 * 1024)
 
 #include "packet.h"
 #include <vector>
@@ -14,7 +14,7 @@
  * |                  |     Header (12 bytes)   |         Payload (M bytes)         |
  * +------------------+-------------------------+-----------------------------------+
  * |                  | Magic | Type |Resv|P Len|                                   |
- * |                  | (4B)  | (1B) |(3B)|(4B) |           (JSON String)           |
+ * |                  | (4B)  | (1B) |(3B)|(4B) |       UTF-8 text or binary        |
  * +------------------+-------+------+----+-----+-----------------------------------+
  */
 
@@ -23,11 +23,20 @@ const size_t HEADER_SIZE = 12; // Magic(4) + Type(1) + Reserved(3) + PayloadLeng
 
 /**
  * @brief Creates the final byte stream to be sent over the network.
- * It serializes the Packet content to JSON, builds the header, and prepends the total length.
+ * It builds the header around Packet::content and prepends the total length.
  * @param pkt The Packet object to serialize.
  * @return A vector of bytes ready for sending.
  */
 std::vector<char> create_message_stream(const Packet& pkt);
+
+/**
+ * @brief Sends exactly n bytes unless the socket errors or closes.
+ * @param socket The socket file descriptor.
+ * @param data The bytes to send.
+ * @param n The byte count to send.
+ * @return True if all bytes were sent, false on error.
+ */
+bool send_all(int socket, const char *data, size_t n);
 
 /**
  * @brief A helper function to read exactly n bytes from a socket.

@@ -1,9 +1,12 @@
 #include "include/protocol.h"
 #include <nlohmann/json.hpp>
 #include <arpa/inet.h>      // For htonl, ntohl
+#include <cerrno>
+#include <cstring>
 #include <vector>
 #include <map>
 #include <glog/logging.h>
+#include <sys/socket.h>
 
 using json = nlohmann::json;
 
@@ -38,6 +41,25 @@ std::vector<char> create_message_stream(const Packet &pkt)
 	return message_stream;
 }
 
+bool send_all(int socket, const char *data, size_t n)
+{
+	size_t bytes_sent = 0;
+	while (bytes_sent < n) {
+		ssize_t result = send(socket, data + bytes_sent, n - bytes_sent, 0);
+		if (result < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return false;
+		}
+		if (result == 0) {
+			return false;
+		}
+		bytes_sent += static_cast<size_t>(result);
+	}
+	return true;
+}
+
 bool read_n_bytes(int socket, size_t n, std::vector<char>& buffer)
 {
 	buffer.resize(n);
@@ -61,7 +83,9 @@ bool read_packet(int socket, Packet& pkt)
 		// Failed to read, likely a disconnect
 		return false;
 	}
-	uint32_t total_len = ntohl(*reinterpret_cast<uint32_t*>(length_buffer.data()));
+	uint32_t total_len_n = 0;
+	memcpy(&total_len_n, length_buffer.data(), sizeof(total_len_n));
+	uint32_t total_len = ntohl(total_len_n);
 
 	if (total_len > MAX_PACKET_SIZE) {
 		LOG(ERROR) << "[Error] Packet size " << total_len
@@ -83,7 +107,9 @@ bool read_packet(int socket, Packet& pkt)
 	}
 
 	// 3. Parse the header and deserialize the payload
-	uint32_t magic = ntohl(*reinterpret_cast<uint32_t*>(packet_data_buffer.data()));
+	uint32_t magic_n = 0;
+	memcpy(&magic_n, packet_data_buffer.data(), sizeof(magic_n));
+	uint32_t magic = ntohl(magic_n);
 	if (magic != MAGIC_NUMBER) {
 		LOG(ERROR) << "[Error] Invalid magic number.";
 		return false;
@@ -92,7 +118,9 @@ bool read_packet(int socket, Packet& pkt)
 	// Populate the output packet
 	pkt.type = static_cast<MessageType>(packet_data_buffer[4]);
 
-	uint32_t payload_len = ntohl(*reinterpret_cast<uint32_t*>(packet_data_buffer.data() + 8));
+	uint32_t payload_len_n = 0;
+	memcpy(&payload_len_n, packet_data_buffer.data() + 8, sizeof(payload_len_n));
+	uint32_t payload_len = ntohl(payload_len_n);
 	if (payload_len > 0) {
 		pkt.content.assign(packet_data_buffer.data() + HEADER_SIZE, payload_len);
 	} else {

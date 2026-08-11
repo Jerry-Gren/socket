@@ -15,6 +15,7 @@
 #include <map>
 
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 
@@ -22,6 +23,7 @@
 #define MAX_CLIENT_QUEUE 20
 
 #include "include/glog_wrapper.h"
+#include "include/file_transfer.h"
 #include "include/protocol.h"
 #include "include/client_info.h"
 #include "include/client_manager.h"
@@ -33,6 +35,11 @@ using json = nlohmann::json;
 std::atomic<bool> g_server_running(true);
 ClientManager g_client_manager;
 const std::string g_server_name = "Lab7-SocketServer";
+
+struct TransferProgressState {
+	int last_percent = -1;
+	std::chrono::steady_clock::time_point started_at;
+};
 
 // Signal handler function
 // Called when SIGINT (Ctrl+C) or SIGTERM (kill) is received
@@ -53,6 +60,45 @@ std::string get_current_time_str()
 	std::ostringstream oss;
 	oss << std::put_time(&timeinfo, "%Y-%m-%dT%H:%M:%SZ");
 	return oss.str();
+}
+
+std::string format_duration(std::chrono::seconds duration)
+{
+	uint64_t total_seconds = static_cast<uint64_t>(duration.count());
+	uint64_t hours = total_seconds / 3600;
+	uint64_t minutes = (total_seconds % 3600) / 60;
+	uint64_t seconds = total_seconds % 60;
+
+	std::ostringstream oss;
+	oss << std::setfill('0') << std::setw(2) << hours << ":"
+	    << std::setw(2) << minutes << ":" << std::setw(2) << seconds;
+	return oss.str();
+}
+
+std::string estimate_remaining_time(
+    uint64_t bytes_sent, uint64_t total_size,
+    std::chrono::steady_clock::time_point started_at,
+    std::chrono::steady_clock::time_point now)
+{
+	if (total_size == 0 || bytes_sent >= total_size) {
+		return "00:00:00";
+	}
+
+	std::chrono::duration<long double> elapsed = now - started_at;
+	if (bytes_sent == 0 || elapsed.count() <= 0.0L) {
+		return "--:--:--";
+	}
+
+	long double bytes_per_second =
+	    static_cast<long double>(bytes_sent) / elapsed.count();
+	if (bytes_per_second <= 0.0L) {
+		return "--:--:--";
+	}
+
+	long double remaining_seconds =
+	    static_cast<long double>(total_size - bytes_sent) / bytes_per_second;
+	return format_duration(std::chrono::seconds(
+	    static_cast<int64_t>(std::ceil(remaining_seconds))));
 }
 
 void handle_get_time_request(int client_id)
@@ -159,27 +205,24 @@ void handle_send_message_request(int client_id, const std::string &content)
 
 void handle_send_file_request(int client_id, const std::string &content)
 {
-	try {
-		json data = json::parse(content);
-		uint64_t target_id = data.at("target_id").get<uint64_t>();
-
-		if (!g_client_manager.get_client(target_id).has_value()) {
-			return;
-		}
-
-		Packet forward_pkt;
-		forward_pkt.type = MessageType::FILE_INDICATION;
-
-		data["from_id"] = client_id;
-		data.erase("target_id");
-
-		forward_pkt.content = data.dump();
-
-		g_client_manager.send_to_client(target_id, forward_pkt);
-
-	} catch (...) {
-		LOG(ERROR) << "Failed to handle file request from " << client_id;
+	FileTransferPayload file_payload;
+	if (!parse_file_transfer_payload(content, file_payload)) {
+		LOG(ERROR) << "Failed to parse file request from " << client_id;
+		return;
 	}
+
+	uint64_t target_id = file_payload.peer_id;
+	if (!g_client_manager.get_client(target_id).has_value()) {
+		return;
+	}
+
+	Packet forward_pkt;
+	forward_pkt.type = MessageType::FILE_INDICATION;
+	forward_pkt.content = create_file_transfer_payload(
+	    client_id, file_payload.total_size, file_payload.bytes_sent,
+	    file_payload.eof, file_payload.filename, file_payload.data);
+
+	g_client_manager.send_to_client(target_id, forward_pkt);
 }
 
 void log_received_packet(int client_id, const Packet &pkt)
@@ -191,46 +234,53 @@ void log_received_packet(int client_id, const Packet &pkt)
 		return;
 	}
 
-	try {
-		json data = json::parse(pkt.content);
-		uint64_t total_size = data.value("total_size", 0);
-		uint64_t bytes_sent = data.value("bytes_sent", 0);
-		uint64_t target_id = data.value("target_id", 0);
-		std::string filename = data.value("filename", "");
-		bool is_eof = data.value("eof", false);
-
-		int progress_percent = 0;
-		if (total_size > 0) {
-			if (bytes_sent > total_size) {
-				bytes_sent = total_size;
-			}
-			progress_percent = static_cast<int>(
-			    (static_cast<long double>(bytes_sent) * 100.0L) /
-			    static_cast<long double>(total_size));
-		}
-		if (is_eof) {
-			progress_percent = 100;
-		}
-
-		static std::map<std::string, int> last_progress_by_transfer;
-		static std::mutex progress_log_mutex;
-		std::string transfer_key = std::to_string(client_id) + ":" +
-		                           std::to_string(target_id) + ":" + filename;
-		std::lock_guard<std::mutex> lock(progress_log_mutex);
-		auto last_progress = last_progress_by_transfer.find(transfer_key);
-		if (last_progress == last_progress_by_transfer.end() ||
-		    last_progress->second != progress_percent) {
-			std::cout << "\r\x1b[2K[File Transfer] "
-			          << progress_percent << "%" << std::flush;
-			last_progress_by_transfer[transfer_key] = progress_percent;
-		}
-		if (is_eof) {
-			std::cout << std::endl;
-			last_progress_by_transfer.erase(transfer_key);
-		}
-	} catch (const json::exception &e) {
+	FileTransferPayload file_payload;
+	if (!parse_file_transfer_payload(pkt.content, file_payload)) {
 		LOG(WARNING) << "[File Transfer] Failed to parse progress from client "
-		             << client_id << ": " << e.what();
+		             << client_id;
+		return;
+	}
+
+	uint64_t total_size = file_payload.total_size;
+	uint64_t bytes_sent = file_payload.bytes_sent;
+	int progress_percent = 0;
+	if (total_size > 0) {
+		if (bytes_sent > total_size) {
+			bytes_sent = total_size;
+		}
+		progress_percent = static_cast<int>(
+		    (static_cast<long double>(bytes_sent) * 100.0L) /
+		    static_cast<long double>(total_size));
+	}
+	if (file_payload.eof) {
+		progress_percent = 100;
+	}
+	static std::map<std::string, TransferProgressState> progress_by_transfer;
+	static std::mutex progress_log_mutex;
+	std::string transfer_key = std::to_string(client_id) + ":" +
+	                           std::to_string(file_payload.peer_id) + ":" +
+	                           file_payload.filename;
+	std::lock_guard<std::mutex> lock(progress_log_mutex);
+	auto now = std::chrono::steady_clock::now();
+	auto [progress_it, inserted] =
+	    progress_by_transfer.try_emplace(transfer_key);
+	if (inserted) {
+		progress_it->second.started_at = now;
+	}
+	if (progress_percent == 0 && !file_payload.eof) {
+		return;
+	}
+
+	if (progress_it->second.last_percent != progress_percent) {
+		std::string eta = estimate_remaining_time(
+		    bytes_sent, total_size, progress_it->second.started_at, now);
+		std::cout << "\r\x1b[2K[File Transfer] "
+		          << progress_percent << "% ETA " << eta << std::flush;
+		progress_it->second.last_percent = progress_percent;
+	}
+	if (file_payload.eof) {
+		std::cout << std::endl;
+		progress_by_transfer.erase(transfer_key);
 	}
 }
 

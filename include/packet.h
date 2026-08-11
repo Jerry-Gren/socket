@@ -38,16 +38,12 @@ enum class MessageType : uint8_t {
 /**
  * @struct Packet
  * @brief In-memory representation of our application-level packet.
- * This struct will be serialized into a JSON string to form the payload.
  */
 struct Packet {
 	MessageType type = MessageType::UNDEFINED; // Type of packet
 
-	// The content is a flexible string, which we will use to store JSON data.
-	// We can easily add different fields for different message types.
-	// e.g., for SEND_MESSAGE_REQUEST: content = R"({"target_id": 123, "message": "Hello"})"
-	// e.g., for GET_TIME_RESPONSE: content = R"({"time": "2025-10-06 15:30:00 JST"})"
-	std::string content; // Content of packet (payload)
+	// Content may be UTF-8 JSON for control messages or binary for file data.
+	std::string content;
 };
 
 #endif // PACKET_H_

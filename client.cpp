@@ -16,8 +16,10 @@
 #include <csignal>
 #include <fstream>
 #include <filesystem>
+#include <map>
 
 #include "include/glog_wrapper.h"
+#include "include/file_transfer.h"
 #include "include/packet.h"
 #include "include/protocol.h"
 #include "include/utility.h"
@@ -158,27 +160,52 @@ void present_messages()
 				break;
 			case MessageType::FILE_INDICATION:
 				try {
-					json data = json::parse(packet_to_show.content);
-					std::string from_id = std::to_string(data.value("from_id", 0));
-					std::string filename = sanitize_for_terminal(data.value("filename", "unknown"));
-					std::string encoded_data = data.value("data", "");
-					bool is_eof = data.value("eof", false);
+					FileTransferPayload file_payload;
+					if (!parse_file_transfer_payload(packet_to_show.content,
+					                                 file_payload)) {
+						output = "[File Error]: Invalid file payload";
+						break;
+					}
+
+					std::string from_id =
+					    std::to_string(file_payload.peer_id);
+					std::string filename =
+					    fs::path(file_payload.filename).filename().string();
+					if (filename.empty()) {
+						filename = "unknown";
+					}
 
 					std::string save_dir = "downloads";
 					if (!fs::exists(save_dir)) fs::create_directory(save_dir);
 
 					std::string save_path = save_dir + "/" + from_id + "_" + filename;
+					std::string transfer_key = save_path;
+					static std::map<std::string, std::ofstream> open_files;
 
-					if (is_eof) {
-						output = "[File]: Finished receiving file: " + save_path;
+					if (file_payload.eof) {
+						auto file_it = open_files.find(transfer_key);
+						if (file_it != open_files.end()) {
+							file_it->second.close();
+							open_files.erase(file_it);
+						} else if (file_payload.total_size == 0) {
+							std::ofstream empty_file(save_path, std::ios::binary);
+							empty_file.close();
+						}
+						output = "[File]: Finished receiving file: " +
+						         sanitize_for_terminal(save_path);
 					} else {
-						std::vector<char> binary_data = base64_decode(encoded_data);
-
-						std::ofstream outfile(save_path, std::ios::binary | std::ios::app);
-						outfile.write(binary_data.data(), binary_data.size());
-						outfile.close();
-
-						std::cout << "." << std::flush;
+						auto [file_it, inserted] = open_files.try_emplace(transfer_key);
+						if (inserted) {
+							file_it->second.open(save_path,
+							                     std::ios::binary | std::ios::trunc);
+						}
+						if (!file_it->second.is_open()) {
+							output = "[File Error]: Failed to open " +
+							         sanitize_for_terminal(save_path);
+							break;
+						}
+						file_it->second.write(file_payload.data.data(),
+						                      file_payload.data.size());
 						continue;
 					}
 
@@ -257,7 +284,7 @@ void on_command_help()
 bool send_packet(int socket, const Packet &pkt)
 {
 	std::vector<char> message_stream = create_message_stream(pkt);
-	if (send(socket, message_stream.data(), message_stream.size(), 0) < 0) {
+	if (!send_all(socket, message_stream.data(), message_stream.size())) {
 		LOG(ERROR) << "[Error] Failed to send packet: "
 		           << MessageTypeToString(pkt.type);
 		g_client_running = false;
@@ -265,24 +292,6 @@ bool send_packet(int socket, const Packet &pkt)
 		return false;
 	}
 	return true;
-}
-
-size_t calculate_file_chunk_size(uint64_t total_size)
-{
-	const size_t MAX_FILE_CHUNK_SIZE = 40 * 1024;
-	if (total_size == 0) {
-		return 1;
-	}
-
-	size_t one_percent_chunk =
-	    static_cast<size_t>((total_size + 99) / 100);
-	if (one_percent_chunk == 0) {
-		return 1;
-	}
-	if (one_percent_chunk > MAX_FILE_CHUNK_SIZE) {
-		return MAX_FILE_CHUNK_SIZE;
-	}
-	return one_percent_chunk;
 }
 
 void on_command_get_time(int socket)
@@ -374,52 +383,42 @@ void on_command_send_file(int socket)
     std::cout << "Enter file path to send: " << std::flush;
     if (!std::getline(std::cin, filepath)) return;
 
-    if (!fs::exists(filepath)) {
-        std::cout << "[Error] File does not exist." << std::endl;
+    if (!fs::exists(filepath) || !fs::is_regular_file(filepath)) {
+        std::cout << "[Error] File does not exist or is not a regular file." << std::endl;
         return;
     }
 
     std::string filename = fs::path(filepath).filename().string();
     std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cout << "[Error] Failed to open file." << std::endl;
+        return;
+    }
     uint64_t total_size = fs::file_size(filepath);
     uint64_t bytes_sent = 0;
 
     size_t chunk_size = calculate_file_chunk_size(total_size);
-    std::vector<char> buffer(chunk_size);
+    std::string buffer(chunk_size, '\0');
 
     LOG(INFO) << "[Cmd] Starting file transfer: " << filename;
 
     while (file.read(buffer.data(), chunk_size) || file.gcount() > 0) {
         size_t bytes_read = file.gcount();
         bytes_sent += bytes_read;
-        std::vector<char> chunk_data(buffer.begin(), buffer.begin() + bytes_read);
-
-        std::string encoded_data = base64_encode(chunk_data);
+        std::string chunk_data(buffer.data(), bytes_read);
 
         Packet pkt;
         pkt.type = MessageType::SEND_FILE_REQUEST;
-        pkt.content = json{
-            {"target_id", target_id},
-            {"filename", filename},
-            {"total_size", total_size},
-            {"bytes_sent", bytes_sent},
-            {"data", encoded_data},
-            {"eof", false}
-        }.dump();
+        pkt.content = create_file_transfer_payload(
+            target_id, total_size, bytes_sent, false, filename, chunk_data);
 
         if (!send_packet(socket, pkt)) return;
     }
 
     Packet end_pkt;
     end_pkt.type = MessageType::SEND_FILE_REQUEST;
-    end_pkt.content = json{
-        {"target_id", target_id},
-        {"filename", filename},
-        {"total_size", total_size},
-        {"bytes_sent", total_size},
-        {"data", ""},
-        {"eof", true}
-    }.dump();
+    end_pkt.content = create_file_transfer_payload(
+        target_id, total_size, total_size, true, filename, "");
     send_packet(socket, end_pkt);
 
     LOG(INFO) << "[Cmd] File sent complete.";
