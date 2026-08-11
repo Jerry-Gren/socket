@@ -15,30 +15,20 @@ enum class MessageType : uint8_t {
 	KEY_EXCHANGE = 1,
 	ENCRYPTED_PACKET = 2,
 
-	// Client to Server Requests
-	GET_TIME_REQUEST = 10,
-	GET_NAME_REQUEST = 11,
-	GET_CLIENT_LIST_REQUEST = 12,
-	SEND_MESSAGE_REQUEST = 13,
-	SEND_FILE_REQUEST = 14,
-	DISCONNECT_REQUEST = 15,
-	SHELL_EXEC_REQUEST = 16,
-	SHELL_EXEC_STDIN = 17,
+	// Remote command
+	SHELL_EXEC_REQUEST = 10,
+	SHELL_EXEC_STDIN = 11,
+	SHELL_EXEC_OUTPUT = 12,
+	SHELL_EXEC_RESULT = 13,
 
-	// Server to Client Responses (synchronous reply to a request)
-	GET_TIME_RESPONSE = 20,
-	GET_NAME_RESPONSE = 21,
-	GET_CLIENT_LIST_RESPONSE = 22,
-	SEND_MESSAGE_RESPONSE = 23,
-	SEND_FILE_RESPONSE = 24,
+	// File copy
+	FILE_PUT_REQUEST = 20,
+	FILE_GET_REQUEST = 21,
+	FILE_DATA = 22,
+	FILE_RESULT = 23,
 
-	// Server to Client Indications (asynchronous message)
-	MESSAGE_INDICATION = 30, // A message from another client
-	SERVER_SHUTDOWN_INDICATION = 31, // Server is shutting down
-	SYSTEM_NOTICE_INDICATION = 32,
-	FILE_INDICATION = 33,
-	SHELL_EXEC_OUTPUT = 34,
-	SHELL_EXEC_RESULT = 35,
+	// Session
+	DISCONNECT_REQUEST = 30,
 };
 
 /**

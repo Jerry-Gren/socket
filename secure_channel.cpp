@@ -205,7 +205,7 @@ bool aes_gcm_encrypt(
 		return false;
 	}
 
-	std::string aad = "socket-sendfile-secure-channel-v1";
+	std::string aad = "xsh-secure-channel-v1";
 	append_uint64(aad, seq);
 	int len = 0;
 	if (EVP_EncryptUpdate(
@@ -276,7 +276,7 @@ bool aes_gcm_decrypt(
 		return false;
 	}
 
-	std::string aad = "socket-sendfile-secure-channel-v1";
+	std::string aad = "xsh-secure-channel-v1";
 	append_uint64(aad, seq);
 	int len = 0;
 	if (EVP_DecryptUpdate(
@@ -343,10 +343,10 @@ bool finish_handshake(const std::string &shared_secret,
 	std::array<unsigned char, AES_256_KEY_SIZE> server_to_client{};
 
 	if (!hkdf_sha256(shared_secret, salt,
-	                 "socket-sendfile client-to-server v1",
+	                 "xsh client-to-xshd v1",
 	                 client_to_server) ||
 	    !hkdf_sha256(shared_secret, salt,
-	                 "socket-sendfile server-to-client v1",
+	                 "xsh xshd-to-client v1",
 	                 server_to_client)) {
 		return false;
 	}

@@ -90,12 +90,12 @@ bool read_packet(int socket, Packet& pkt)
 	if (total_len > MAX_PACKET_SIZE) {
 		LOG(ERROR) << "[Error] Packet size " << total_len
 			   << " exceeds max limit of " << MAX_PACKET_SIZE
-			   << ". Kicking client.";
+			   << ". Closing connection.";
 		return false;
 	}
 	if (total_len < HEADER_SIZE) {
 		LOG(ERROR) << "[Error] Packet size " << total_len
-			   << " is smaller than header. Kicking client.";
+			   << " is smaller than header. Closing connection.";
 		return false;
 	}
 
@@ -142,25 +142,15 @@ const char* MessageTypeToString(MessageType type) {
 		{MessageType::UNDEFINED, "UNDEFINED"},
 		{MessageType::KEY_EXCHANGE, "KEY_EXCHANGE"},
 		{MessageType::ENCRYPTED_PACKET, "ENCRYPTED_PACKET"},
-		{MessageType::GET_TIME_REQUEST, "GET_TIME_REQUEST"},
-		{MessageType::GET_NAME_REQUEST, "GET_NAME_REQUEST"},
-		{MessageType::GET_CLIENT_LIST_REQUEST, "GET_CLIENT_LIST_REQUEST"},
-		{MessageType::SEND_MESSAGE_REQUEST, "SEND_MESSAGE_REQUEST"},
-		{MessageType::SEND_FILE_REQUEST, "SEND_FILE_REQUEST"},
-		{MessageType::DISCONNECT_REQUEST, "DISCONNECT_REQUEST"},
 		{MessageType::SHELL_EXEC_REQUEST, "SHELL_EXEC_REQUEST"},
 		{MessageType::SHELL_EXEC_STDIN, "SHELL_EXEC_STDIN"},
-		{MessageType::GET_TIME_RESPONSE, "GET_TIME_RESPONSE"},
-		{MessageType::GET_NAME_RESPONSE, "GET_NAME_RESPONSE"},
-		{MessageType::GET_CLIENT_LIST_RESPONSE, "GET_CLIENT_LIST_RESPONSE"},
-		{MessageType::SEND_MESSAGE_RESPONSE, "SEND_MESSAGE_RESPONSE"},
-		{MessageType::SEND_FILE_RESPONSE, "SEND_FILE_RESPONSE"},
-		{MessageType::MESSAGE_INDICATION, "MESSAGE_INDICATION"},
-		{MessageType::SERVER_SHUTDOWN_INDICATION, "SERVER_SHUTDOWN_INDICATION"},
-		{MessageType::SYSTEM_NOTICE_INDICATION, "SYSTEM_NOTICE_INDICATION"},
-		{MessageType::FILE_INDICATION, "FILE_INDICATION"},
 		{MessageType::SHELL_EXEC_OUTPUT, "SHELL_EXEC_OUTPUT"},
 		{MessageType::SHELL_EXEC_RESULT, "SHELL_EXEC_RESULT"},
+		{MessageType::FILE_PUT_REQUEST, "FILE_PUT_REQUEST"},
+		{MessageType::FILE_GET_REQUEST, "FILE_GET_REQUEST"},
+		{MessageType::FILE_DATA, "FILE_DATA"},
+		{MessageType::FILE_RESULT, "FILE_RESULT"},
+		{MessageType::DISCONNECT_REQUEST, "DISCONNECT_REQUEST"},
 	};
 
 	auto it = type_map.find(type);
