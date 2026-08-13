@@ -47,7 +47,7 @@ struct Options {
 	int port = DEFAULT_SERVER_PORT;
 	std::string identity_file;
 	std::string known_hosts_file;
-	RemotePath source;
+	std::vector<RemotePath> sources;
 	RemotePath destination;
 };
 
@@ -60,11 +60,13 @@ void print_usage(const char *program)
 {
 	std::cerr
 	    << "Usage:\n"
-	    << "  " << program << " [options] source destination\n"
+	    << "  " << program << " [options] source... destination\n"
 	    << "\n"
 	    << "Copy files through xshd using scp-like paths:\n"
 	    << "  " << program << " local.bin user@host:/tmp/local.bin\n"
 	    << "  " << program << " user@host:/tmp/remote.bin ./remote.bin\n"
+	    << "  " << program << " local1 local2 user@host:/tmp/dir\n"
+	    << "  " << program << " user@host:/tmp/a user@host:/tmp/b ./dir\n"
 	    << "\n"
 	    << "Options:\n"
 	    << "  -r, -R            Copy directories recursively\n"
@@ -190,16 +192,45 @@ bool parse_arguments(int argc, char *argv[], Options &options)
 		return false;
 	}
 
-	if (argc - i != 2) {
+	if (argc - i < 2) {
 		std::cerr << "xcp: expected source and destination\n";
 		return false;
 	}
 
-	options.source = parse_path(argv[i]);
-	options.destination = parse_path(argv[i + 1]);
-	if (options.source.remote == options.destination.remote) {
+	options.destination = parse_path(argv[argc - 1]);
+	for (int source_index = i; source_index < argc - 1; ++source_index) {
+		options.sources.push_back(parse_path(argv[source_index]));
+	}
+	if (options.sources.empty()) {
+		std::cerr << "xcp: expected at least one source\n";
+		return false;
+	}
+
+	bool sources_are_remote = options.sources.front().remote;
+	for (const auto &source : options.sources) {
+		if (source.remote != sources_are_remote) {
+			std::cerr << "xcp: mixed local and remote sources are not supported\n";
+			return false;
+		}
+	}
+	if (sources_are_remote == options.destination.remote) {
 		std::cerr << "xcp: exactly one path must be remote\n";
 		return false;
+	}
+	if (sources_are_remote) {
+		const RemotePath &first = options.sources.front();
+		std::string first_username =
+		    first.username.empty() ? default_username() : first.username;
+		for (const auto &source : options.sources) {
+			std::string source_username =
+			    source.username.empty() ? default_username() : source.username;
+			if (source.host != first.host ||
+			    source_username != first_username) {
+				std::cerr
+				    << "xcp: remote sources must use the same user and host\n";
+				return false;
+			}
+		}
 	}
 	return true;
 }
@@ -385,6 +416,23 @@ std::string path_basename(const std::string &value)
 	fs::path path(trimmed);
 	std::string name = path.filename().string();
 	return name.empty() ? "file" : name;
+}
+
+bool has_trailing_separator(const std::string &path)
+{
+	return !path.empty() && (path.back() == '/' || path.back() == '\\');
+}
+
+std::string join_remote_child(const std::string &parent,
+                              const std::string &child)
+{
+	if (parent.empty() || parent == ".") {
+		return child;
+	}
+	if (has_trailing_separator(parent)) {
+		return parent + child;
+	}
+	return parent + "/" + child;
 }
 
 bool append_transfer_entry(const fs::path &path,
@@ -638,9 +686,8 @@ bool send_file_upload(int socket_fd, SecureSession &secure_session,
 
 	uint64_t request_id = 1;
 	std::string destination_path = remote_path;
-	if (!destination_path.empty() &&
-	    (destination_path.back() == '/' || destination_path.back() == '\\')) {
-		destination_path += source.filename().string();
+	if (has_trailing_separator(destination_path)) {
+		destination_path += path_basename(source.string());
 	}
 	bool source_is_directory = fs::is_directory(source);
 
@@ -838,10 +885,24 @@ int main(int argc, char *argv[])
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
 
-	std::string host = options.source.remote ? options.source.host
-	                                         : options.destination.host;
-	std::string username = options.source.remote ? options.source.username
-	                                             : options.destination.username;
+	bool sources_are_remote = options.sources.front().remote;
+	bool multiple_sources = options.sources.size() > 1;
+	if (sources_are_remote && multiple_sources) {
+		std::error_code ec;
+		if (!fs::exists(options.destination.path, ec) ||
+		    !fs::is_directory(options.destination.path, ec)) {
+			std::cerr
+			    << "xcp: local destination must be an existing directory "
+			       "when copying multiple remote sources\n";
+			return 2;
+		}
+	}
+
+	std::string host = sources_are_remote ? options.sources.front().host
+	                                      : options.destination.host;
+	std::string username = sources_are_remote
+	                           ? options.sources.front().username
+	                           : options.destination.username;
 	if (username.empty()) {
 		username = default_username();
 	}
@@ -859,16 +920,32 @@ int main(int argc, char *argv[])
 	}
 
 	bool success = false;
-	if (!options.source.remote) {
-		success = send_file_upload(socket_fd, secure_session,
-		                           options.source.path,
-		                           options.destination.path,
-		                           options.recursive);
+	if (!sources_are_remote) {
+		success = true;
+		for (const auto &source : options.sources) {
+			std::string remote_destination = options.destination.path;
+			if (multiple_sources) {
+				remote_destination = join_remote_child(
+				    remote_destination, path_basename(source.path));
+			}
+			if (!send_file_upload(socket_fd, secure_session,
+			                      source.path, remote_destination,
+			                      options.recursive)) {
+				success = false;
+				break;
+			}
+		}
 	} else {
-		success = receive_file_download(socket_fd, secure_session,
-		                                options.source.path,
-		                                options.destination.path,
-		                                options.recursive);
+		success = true;
+		for (const auto &source : options.sources) {
+			if (!receive_file_download(socket_fd, secure_session,
+			                           source.path,
+			                           options.destination.path,
+			                           options.recursive)) {
+				success = false;
+				break;
+			}
+		}
 	}
 
 	Packet disconnect;

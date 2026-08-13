@@ -557,6 +557,12 @@ bool create_directory_at_path(const fs::path &path, std::string &error)
 		        path.parent_path().string();
 		return false;
 	}
+	if (!path.parent_path().empty() &&
+	    !fs::is_directory(path.parent_path(), ec)) {
+		error = "destination parent is not a directory: " +
+		        path.parent_path().string();
+		return false;
+	}
 	if (!fs::create_directory(path, ec)) {
 		error = "failed to create directory " + path.string() + ": " +
 		        ec.message();
@@ -585,6 +591,11 @@ bool validate_upload_destination(const fs::path &path, bool recursive,
 	fs::path parent = path.parent_path();
 	if (!parent.empty() && !fs::exists(parent, ec)) {
 		error = "destination parent does not exist: " + parent.string();
+		return false;
+	}
+	if (!parent.empty() && !fs::is_directory(parent, ec)) {
+		error = "destination parent is not a directory: " +
+		        parent.string();
 		return false;
 	}
 	return true;
